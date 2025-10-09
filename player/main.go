@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -59,13 +60,29 @@ var stopChan = make(chan struct{}, 1)
 // shutdown channel is now used for all forms of termination.
 var shutdown = make(chan struct{})
 
+// logFile is the file where logs will be written.
+var logFile *os.File
+
+func init() {
+	var err error
+	// Open dj.log in the current directory, creating it if it doesn't exist.
+	logFile, err = os.OpenFile("dj.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		log.Fatalf("FATAL: cannot open dj.log: %v", err)
+	}
+	// Direct log output to both standard error and the log file.
+	log.SetOutput(io.MultiWriter(os.Stderr, logFile))
+}
+
 func main() {
+	defer logFile.Close()
 	if len(os.Args) < 2 {
 		// Using `say` for voice feedback on error
 		speak("You need to provide a command.")
 		log.Fatalf("Usage: %s \"<command>\"", os.Args[0])
 	}
 	command := os.Args[1]
+	log.Printf("Received command: %q", command)
 
 	// Dispatch control commands to a running player instance.
 	if command == "skip" || command == "stop" {
@@ -190,6 +207,7 @@ func handleShutdown() {
 
 // speak uses the macOS `say` command to provide voice feedback.
 func speak(text string) {
+	log.Printf("SAY: %s", text)
 	// Also print to stdout for the Siri Shortcut to capture
 	fmt.Println(text)
 	cmd := exec.Command("say", text)
