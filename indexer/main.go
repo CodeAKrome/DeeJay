@@ -51,10 +51,25 @@ type Song struct {
 
 func main() {
 	if len(os.Args) < 2 {
-		log.Fatalf("Usage: %s <music_directory>", os.Args[0])
+		printUsage()
+		os.Exit(1)
 	}
-	musicDir := os.Args[1]
 
+	switch os.Args[1] {
+	case "index":
+		if len(os.Args) < 3 {
+			log.Fatalf("Usage: %s index <music_directory>", os.Args[0])
+		}
+		musicDir := os.Args[2]
+		runIndexer(musicDir)
+	default:
+		log.Printf("Unknown command: %s", os.Args[1])
+		printUsage()
+		os.Exit(1)
+	}
+}
+
+func runIndexer(musicDir string) {
 	// --- MongoDB Connection ---
 	mongoUser := os.Getenv("MONGO_USER")
 	if mongoUser == "" {
@@ -176,6 +191,12 @@ func main() {
 	}
 }
 
+func printUsage() {
+	fmt.Printf("Usage: %s <command> [arguments]\n\n", os.Args[0])
+	fmt.Println("Available commands:")
+	fmt.Println("  index <music_directory>    Scans a directory and indexes music files into MongoDB.")
+}
+
 // worker processes files from the jobs channel and sends results to the results channel.
 func worker(id int, jobs <-chan string, results chan<- *Song, wg *sync.WaitGroup) {
 	defer wg.Done()
@@ -271,13 +292,13 @@ func createIndexes(collection *mongo.Collection) error {
 func findAndReportDuplicates(collection *mongo.Collection) error {
 	pipeline := mongo.Pipeline{
 		bson.D{{Key: "$group", Value: bson.D{
-			{Key: "_id", Value: ""},
-			{Key: "paths", Value: bson.D{{Key: "", Value: ""}}},
-			{Key: "sizes", Value: bson.D{{Key: "", Value: ""}}},
-			{Key: "count", Value: bson.D{{Key: "", Value: 1}}},
+			{Key: "_id", Value: "$file_hash"},
+			{Key: "paths", Value: bson.D{{Key: "$push", Value: "$_id"}}},
+			{Key: "sizes", Value: bson.D{{Key: "$push", Value: "$file_size"}}},
+			{Key: "count", Value: bson.D{{Key: "$sum", Value: 1}}},
 		}}},
-		bson.D{{Key: "", Value: bson.D{
-			{Key: "count", Value: bson.D{{Key: "", Value: 1}}},
+		bson.D{{Key: "$match", Value: bson.D{
+			{Key: "count", Value: bson.D{{Key: "$gt", Value: 1}}},
 		}}},
 	}
 
