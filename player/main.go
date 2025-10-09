@@ -24,6 +24,7 @@ import (
 const (
 	dbName         = "music"
 	collectionName = "songs"
+	pidFile        = "/tmp/dj.pid"
 )
 
 // Song represents the structure of a music file's metadata in MongoDB.
@@ -50,6 +51,12 @@ type PlayerStats struct {
 
 // Global variables for stats and shutdown signal.
 var stats = PlayerStats{StartTime: time.Now()}
+
+// Channels for playback control.
+var skipChan = make(chan struct{}, 1)
+var stopChan = make(chan struct{}, 1)
+
+// shutdown channel is now used for all forms of termination.
 var shutdown = make(chan struct{})
 
 func main() {
@@ -60,14 +67,29 @@ func main() {
 	}
 	command := os.Args[1]
 
+	// Dispatch control commands to a running player instance.
+	if command == "skip" || command == "stop" {
+		handleControlCommand(command)
+		return
+	}
+
 	// Handle Ctrl-C for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	// Listen for interrupt, term (for graceful shutdown), and our custom signals.
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGUSR1, syscall.SIGUSR2)
 	go func() {
-		<-sigChan
-		log.Println("\nReceived interrupt signal. Stopping playback...")
-		speak("Stopping playback.")
-		close(shutdown) // Signal all goroutines to stop.
+		for sig := range sigChan {
+			switch sig {
+			case syscall.SIGUSR1:
+				log.Println("Received skip signal (SIGUSR1).")
+				skipChan <- struct{}{}
+			case syscall.SIGUSR2:
+				log.Println("Received stop signal (SIGUSR2).")
+				stopChan <- struct{}{}
+			case os.Interrupt, syscall.SIGTERM:
+				handleShutdown()
+			}
+		}
 	}()
 
 	stats.mu.Lock()
@@ -146,11 +168,24 @@ func main() {
 	stats.CommandsSucceeded++
 	stats.mu.Unlock()
 
+	// Write PID file to allow other instances to control this one.
+	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0644); err != nil {
+		log.Printf("Warning: could not write PID file: %v", err)
+	}
+	defer os.Remove(pidFile)
+
 	// --- Play Music ---
 	playSongs(songs)
 
 	// Print stats at the end of a successful run or graceful shutdown.
 	printStatistics()
+}
+
+// handleShutdown centralizes the shutdown logic.
+func handleShutdown() {
+	log.Println("\nReceived interrupt signal. Stopping playback...")
+	speak("Stopping playback.")
+	close(shutdown) // Signal all goroutines to stop.
 }
 
 // speak uses the macOS `say` command to provide voice feedback.
@@ -173,6 +208,7 @@ func playSongs(songs []Song) {
 	speak(response)
 
 	var currentPlaybackCmd *exec.Cmd
+	var playbackDone = make(chan error, 1)
 
 	for i, song := range songs {
 		select {
@@ -186,33 +222,46 @@ func playSongs(songs []Song) {
 		log.Printf("Playing (%d/%d): %s - %s (%s)", i+1, count, song.Artist, song.Title, song.ID)
 		currentPlaybackCmd = exec.Command("afplay", song.ID)
 
-		// Goroutine to kill the process if a shutdown is signaled mid-song.
+		// Run the song in a goroutine so we don't block.
+		startTime := time.Now()
 		go func() {
-			<-shutdown
-			if currentPlaybackCmd != nil && currentPlaybackCmd.Process != nil {
-				log.Println("Terminating active 'afplay' process.")
-				currentPlaybackCmd.Process.Kill()
-			}
+			playbackDone <- currentPlaybackCmd.Run()
 		}()
 
-		startTime := time.Now()
-		err := currentPlaybackCmd.Run()
-		playbackDuration := time.Since(startTime)
-
-		// Check if shutdown was signaled. If so, cmd.Run() would have returned an error.
+		// Wait for the song to finish, or for a control signal.
+		var err error
+		interrupted := false
 		select {
 		case <-shutdown:
 			log.Println("Playback interrupted by shutdown signal.")
+			if currentPlaybackCmd.Process != nil {
+				currentPlaybackCmd.Process.Kill()
+			}
 			return
-		default:
-			// Not a shutdown, process as normal.
+		case <-stopChan:
+			log.Println("Stopping playlist.")
+			if currentPlaybackCmd.Process != nil {
+				currentPlaybackCmd.Process.Kill()
+			}
+			return
+		case <-skipChan:
+			log.Println("Skipping to next song.")
+			if currentPlaybackCmd.Process != nil {
+				currentPlaybackCmd.Process.Kill()
+			}
+			interrupted = true
+			// Continue to the next iteration of the loop.
+			continue
+		case err = <-playbackDone:
+			// Song finished normally.
 		}
 
-		if err != nil {
-			// afplay was likely killed by the shutdown signal, which is expected.
-			// We only log an error if it wasn't a shutdown.
+		playbackDuration := time.Since(startTime)
+
+		if err != nil && !interrupted {
+			// Log error only if it wasn't an intentional interruption.
 			log.Printf("Error playing %s: %v", song.ID, err)
-		} else {
+		} else if err == nil {
 			// Song completed successfully
 			stats.mu.Lock()
 			stats.SongsPlayed++
@@ -221,6 +270,42 @@ func playSongs(songs []Song) {
 		}
 	}
 	log.Println("Playlist finished.")
+}
+
+// handleControlCommand sends a signal to the running player process.
+func handleControlCommand(command string) {
+	pidBytes, err := os.ReadFile(pidFile)
+	if err != nil {
+		log.Fatalf("Could not read PID file. Is a song playing? Error: %v", err)
+	}
+
+	pid, err := strconv.Atoi(string(pidBytes))
+	if err != nil {
+		log.Fatalf("Invalid PID found in PID file: %v", err)
+	}
+
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		log.Fatalf("Could not find running player process with PID %d: %v", pid, err)
+	}
+
+	var sig syscall.Signal
+	switch command {
+	case "skip":
+		sig = syscall.SIGUSR1
+		speak("Skipping.")
+	case "stop":
+		sig = syscall.SIGUSR2
+		speak("Stopping.")
+	default:
+		log.Fatalf("Unknown control command: %s", command)
+	}
+
+	if err := process.Signal(sig); err != nil {
+		log.Fatalf("Failed to send %s signal to process %d: %v", command, pid, err)
+	}
+
+	log.Printf("Successfully sent %s signal to process %d.", command, pid)
 }
 
 // printStatistics prints a summary report of the session.
