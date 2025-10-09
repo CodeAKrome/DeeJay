@@ -369,7 +369,7 @@ func parseCommandWithOllama(ctx context.Context, command string) (bson.M, error)
 	prompt := fmt.Sprintf("You are a music selection assistant. Your task is to analyze the user's request and call the `create_playlist` tool with the appropriate parameters. Only respond with the JSON for the tool call. User request: '%s'", command)
 
 	req := &ollama.GenerateRequest{
-		Model:  "deepseek-r1:70b", // Using gemma:2b as a fast and capable model. Change to "gpt-oss:20b" if you have it.
+		Model:  "llama3.1:8b", // Using gemma:2b as a fast and capable model. Change to "gpt-oss:20b" if you have it.
 		Prompt: prompt,
 		Format: json.RawMessage(`"json"`), // Instruct Ollama to output JSON
 		System: "You are a helpful assistant that extracts information from a user's request and formats it as a JSON tool call. The tool you have available is: " + toolDefinition,
