@@ -222,6 +222,11 @@ func playSongs(songs []Song) {
 		log.Printf("Playing (%d/%d): %s - %s (%s)", i+1, count, song.Artist, song.Title, song.ID)
 		currentPlaybackCmd = exec.Command("afplay", song.ID)
 
+		// Set a Process Group ID on the command. This allows us to kill the process
+		// and any of its children reliably, even if the main Go program's view of
+		// the process state is not yet updated.
+		currentPlaybackCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
 		// Run the song in a goroutine so we don't block.
 		startTime := time.Now()
 		go func() {
@@ -234,20 +239,20 @@ func playSongs(songs []Song) {
 		select {
 		case <-shutdown:
 			log.Println("Playback interrupted by shutdown signal.")
-			if currentPlaybackCmd.Process != nil {
-				currentPlaybackCmd.Process.Kill()
+			if currentPlaybackCmd.Process != nil && currentPlaybackCmd.Process.Pid > 0 {
+				syscall.Kill(-currentPlaybackCmd.Process.Pid, syscall.SIGKILL)
 			}
 			return
 		case <-stopChan:
 			log.Println("Stopping playlist.")
-			if currentPlaybackCmd.Process != nil {
-				currentPlaybackCmd.Process.Kill()
+			if currentPlaybackCmd.Process != nil && currentPlaybackCmd.Process.Pid > 0 {
+				syscall.Kill(-currentPlaybackCmd.Process.Pid, syscall.SIGKILL)
 			}
 			return
 		case <-skipChan:
 			log.Println("Skipping to next song.")
-			if currentPlaybackCmd.Process != nil {
-				currentPlaybackCmd.Process.Kill()
+			if currentPlaybackCmd.Process != nil && currentPlaybackCmd.Process.Pid > 0 {
+				syscall.Kill(-currentPlaybackCmd.Process.Pid, syscall.SIGKILL)
 			}
 			interrupted = true
 			// Continue to the next iteration of the loop.
