@@ -2,16 +2,21 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
-	"regexp"
+	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
+	ollama "github.com/ollama/ollama/api"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
@@ -28,8 +33,24 @@ type Song struct {
 	Title  string `bson:"title"`
 	Artist string `bson:"artist"`
 	Album  string `bson:"album"`
+	Genre  string `bson:"genre"`
 	Year   int    `bson:"year"`
 }
+
+// PlayerStats holds statistics for the player session.
+type PlayerStats struct {
+	mu                sync.Mutex
+	StartTime         time.Time
+	CommandsProcessed int64
+	CommandsSucceeded int64
+	CommandsFailed    int64
+	SongsPlayed       int64
+	TotalPlaybackTime time.Duration
+}
+
+// Global variables for stats and shutdown signal.
+var stats = PlayerStats{StartTime: time.Now()}
+var shutdown = make(chan struct{})
 
 func main() {
 	if len(os.Args) < 2 {
@@ -39,6 +60,19 @@ func main() {
 	}
 	command := os.Args[1]
 
+	// Handle Ctrl-C for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		log.Println("\nReceived interrupt signal. Stopping playback...")
+		speak("Stopping playback.")
+		close(shutdown) // Signal all goroutines to stop.
+	}()
+
+	stats.mu.Lock()
+	stats.CommandsProcessed++
+	stats.mu.Unlock()
 	// --- MongoDB Connection ---
 	mongoUser := os.Getenv("MONGO_USER")
 	if mongoUser == "" {
@@ -50,20 +84,32 @@ func main() {
 	}
 
 	uri := fmt.Sprintf("mongodb://%s:%s@localhost:27017", mongoUser, mongoPass)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	// Short context for quick DB connection check
+	mongoCtx, mongoCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer mongoCancel()
 
-	client, err := mongo.Connect(ctx, options.Client().ApplyURI(uri))
+	client, err := mongo.Connect(mongoCtx, options.Client().ApplyURI(uri))
 	if err != nil {
 		speak("I could not connect to the music database.")
 		log.Fatalf("Failed to connect to MongoDB: %v", err)
 	}
 	defer client.Disconnect(context.Background())
 
+	// Create a new, longer context for the Ollama call
+	ollamaCtx, ollamaCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer ollamaCancel()
 	collection := client.Database(dbName).Collection(collectionName)
 
 	// --- Parse Command and Execute ---
-	filter := parseCommand(command)
+	filter, err := parseCommandWithOllama(ollamaCtx, command)
+	if err != nil {
+		stats.mu.Lock()
+		stats.CommandsFailed++
+		stats.mu.Unlock()
+		speak("Sorry, I had trouble understanding that.")
+		log.Printf("Ollama parsing error: %v", err)
+		return
+	}
 	if len(filter) == 0 {
 		speak("Sorry, I didn't understand that. Please try something like, play songs by Queen, or play music from 1999.")
 		return
@@ -74,6 +120,9 @@ func main() {
 
 	cursor, err := collection.Find(context.Background(), filter, findOptions)
 	if err != nil {
+		stats.mu.Lock()
+		stats.CommandsFailed++
+		stats.mu.Unlock()
 		speak("I had trouble searching for that music.")
 		log.Fatalf("Failed to query MongoDB: %v", err)
 	}
@@ -81,6 +130,9 @@ func main() {
 
 	var songs []Song
 	if err = cursor.All(context.Background(), &songs); err != nil {
+		stats.mu.Lock()
+		stats.CommandsFailed++
+		stats.mu.Unlock()
 		speak("I had trouble getting the song list.")
 		log.Fatalf("Failed to decode songs: %v", err)
 	}
@@ -90,8 +142,15 @@ func main() {
 		return
 	}
 
+	stats.mu.Lock()
+	stats.CommandsSucceeded++
+	stats.mu.Unlock()
+
 	// --- Play Music ---
 	playSongs(songs)
+
+	// Print stats at the end of a successful run or graceful shutdown.
+	printStatistics()
 }
 
 // speak uses the macOS `say` command to provide voice feedback.
@@ -113,78 +172,187 @@ func playSongs(songs []Song) {
 	}
 	speak(response)
 
+	var currentPlaybackCmd *exec.Cmd
+
 	for i, song := range songs {
-		log.Printf("Playing (%d/%d): %s - %s", i+1, count, song.Artist, song.Title)
-		cmd := exec.Command("afplay", song.ID)
-		// This will block until the song is finished.
-		// For a more advanced player, you'd run this in a goroutine
-		// and add controls for skip, stop, etc.
-		err := cmd.Run()
+		select {
+		case <-shutdown:
+			log.Println("Shutdown signal received, exiting playback loop.")
+			return
+		default:
+			// Continue to next song
+		}
+
+		log.Printf("Playing (%d/%d): %s - %s (%s)", i+1, count, song.Artist, song.Title, song.ID)
+		currentPlaybackCmd = exec.Command("afplay", song.ID)
+
+		// Goroutine to kill the process if a shutdown is signaled mid-song.
+		go func() {
+			<-shutdown
+			if currentPlaybackCmd != nil && currentPlaybackCmd.Process != nil {
+				log.Println("Terminating active 'afplay' process.")
+				currentPlaybackCmd.Process.Kill()
+			}
+		}()
+
+		startTime := time.Now()
+		err := currentPlaybackCmd.Run()
+		playbackDuration := time.Since(startTime)
+
+		// Check if shutdown was signaled. If so, cmd.Run() would have returned an error.
+		select {
+		case <-shutdown:
+			log.Println("Playback interrupted by shutdown signal.")
+			return
+		default:
+			// Not a shutdown, process as normal.
+		}
+
 		if err != nil {
+			// afplay was likely killed by the shutdown signal, which is expected.
+			// We only log an error if it wasn't a shutdown.
 			log.Printf("Error playing %s: %v", song.ID, err)
+		} else {
+			// Song completed successfully
+			stats.mu.Lock()
+			stats.SongsPlayed++
+			stats.TotalPlaybackTime += playbackDuration
+			stats.mu.Unlock()
 		}
 	}
 	log.Println("Playlist finished.")
 }
 
-// parseCommand is a simple NLU to convert a text command into a MongoDB filter.
-func parseCommand(command string) bson.M {
-	filter := bson.M{}
-	command = strings.ToLower(command)
+// printStatistics prints a summary report of the session.
+func printStatistics() {
+	stats.mu.Lock()
+	defer stats.mu.Unlock()
 
-	// --- Keyword: by (Artist) ---
-	// Example: "play songs by Queen" or "play songs by "The Beatles""
-	if matches := findNamedCapture(command, `by (?:"([^"]+)"|(\w+(?:\s\w+)*))`); len(matches) > 0 {
-		filter["artist"] = bson.M{"$regex": strings.Join(matches, ""), "$options": "i"}
-	}
-
-	// --- Keyword: called / title (Song Title) ---
-	// Example: "play the song called "Hey Jude""
-	if matches := findNamedCapture(command, `(?:called|title) (?:"([^"]+)"|(\w+(?:\s\w+)*))`); len(matches) > 0 {
-		filter["title"] = bson.M{"$regex": strings.Join(matches, ""), "$options": "i"}
-	}
-
-	// --- Keyword: from the album / album ---
-	// Example: "play songs from the album "A Night at the Opera""
-	if matches := findNamedCapture(command, `(?:from the album|album) (?:"([^"]+)"|(\w+(?:\s\w+)*))`); len(matches) > 0 {
-		filter["album"] = bson.M{"$regex": strings.Join(matches, ""), "$options": "i"}
-	}
-
-	// --- Keyword: from the year / in (Year) ---
-	// Example: "play music from the year 1999" or "play music in 1999"
-	yearRe := regexp.MustCompile(`(?:from the year|in|from) (\d{4})`)
-	if yearMatch := yearRe.FindStringSubmatch(command); len(yearMatch) > 1 {
-		if year, err := strconv.Atoi(yearMatch[1]); err == nil {
-			filter["year"] = year
-		}
-	}
-
-	// If we are just playing a single song, be more specific with the title search
-	if strings.Contains(command, "play the song") && filter["title"] != nil {
-		// Let's try an exact match first for single songs
-		if titlePattern, ok := filter["title"].(bson.M)["$regex"].(string); ok {
-			filter["title"] = bson.M{"$regex": fmt.Sprintf("^%s$", titlePattern), "$options": "i"}
-		}
-	}
-
-	return filter
+	fmt.Printf("\n--- Playback Session Statistics ---\n")
+	fmt.Printf("  Session Duration:   %v\n", time.Since(stats.StartTime).Round(time.Second))
+	fmt.Printf("  Commands Processed: %d\n", stats.CommandsProcessed)
+	fmt.Printf("  - Succeeded:        %d\n", stats.CommandsSucceeded)
+	fmt.Printf("  - Failed:           %d\n", stats.CommandsFailed)
+	fmt.Printf("  Songs Completed:    %d\n", stats.SongsPlayed)
+	fmt.Printf("  Total Playback Time: %v\n", stats.TotalPlaybackTime.Round(time.Second))
+	fmt.Println("-----------------------------------")
 }
 
-// findNamedCapture is a helper to extract a value that is either in quotes or is a series of words.
-func findNamedCapture(text, pattern string) []string {
-	r := regexp.MustCompile(pattern)
-	matches := r.FindStringSubmatch(text)
+// Tool definition for the Ollama model
+const toolDefinition = `
+{
+  "name": "create_playlist",
+  "description": "Create a playlist based on user specifications for artist, album, title, genre, or year.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "artist": {
+        "type": "string",
+        "description": "The name of the artist or band."
+      },
+      "album": {
+        "type": "string",
+        "description": "The name of the album."
+      },
+      "title": {
+        "type": "string",
+        "description": "The title of the song."
+      },
+      "genre": {
+        "type": "string",
+        "description": "The genre of the music, for example 'Rock', 'Pop', or 'Jazz'."
+      },
+      "year": {
+        "type": "number",
+        "description": "The release year of the music."
+      }
+    },
+    "required": []
+  }
+}
+`
 
-	if len(matches) > 1 {
-		// The result will be in one of the capture groups.
-		// The first group is the full match, so we check from index 1 onwards.
-		for i := 1; i < len(matches); i++ {
-			if matches[i] != "" {
-				return []string{matches[i]}
+// parseCommandWithOllama uses a local Ollama model to convert a text command into a MongoDB filter.
+func parseCommandWithOllama(ctx context.Context, command string) (bson.M, error) {
+	// Connect to the local Ollama server
+	client, err := ollama.ClientFromEnvironment()
+	if err != nil {
+		return nil, fmt.Errorf("could not create ollama client: %w", err)
+	}
+
+	// Prepare the prompt for the model
+	prompt := fmt.Sprintf("You are a music selection assistant. Your task is to analyze the user's request and call the `create_playlist` tool with the appropriate parameters. Only respond with the JSON for the tool call. User request: '%s'", command)
+
+	req := &ollama.GenerateRequest{
+		Model:  "deepseek-r1:70b", // Using gemma:2b as a fast and capable model. Change to "gpt-oss:20b" if you have it.
+		Prompt: prompt,
+		Format: json.RawMessage(`"json"`), // Instruct Ollama to output JSON
+		System: "You are a helpful assistant that extracts information from a user's request and formats it as a JSON tool call. The tool you have available is: " + toolDefinition,
+	}
+
+	var responseText string
+	respFunc := func(resp ollama.GenerateResponse) error {
+		responseText += resp.Response
+		return nil
+	}
+
+	// Call the Ollama API
+	err = client.Generate(ctx, req, respFunc)
+	if err != nil {
+		return nil, fmt.Errorf("ollama generation failed: %w", err)
+	}
+
+	// Print the raw response from Ollama for debugging purposes.
+	log.Printf("Ollama raw response: %s", responseText)
+
+	// The model should return a JSON object representing the tool call.
+	// Example: {"name": "create_playlist", "arguments": {"artist": "Queen"}}
+	var toolCall struct {
+		Name       string                 `json:"name"`
+		Parameters map[string]interface{} `json:"parameters"`
+	}
+
+	// The model's output might be wrapped in markdown, so we clean it.
+	cleanedJSON := strings.Trim(responseText, " \n\t`")
+	if strings.HasPrefix(cleanedJSON, "json") {
+		cleanedJSON = strings.TrimPrefix(cleanedJSON, "json")
+	}
+	cleanedJSON = strings.Trim(cleanedJSON, " \n\t`")
+
+	if err := json.Unmarshal([]byte(cleanedJSON), &toolCall); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal ollama response: %w. Response was: %s", err, cleanedJSON)
+	}
+
+	if toolCall.Name != "create_playlist" || toolCall.Parameters == nil {
+		return nil, fmt.Errorf("model did not return a valid create_playlist tool call. Received: %s", cleanedJSON)
+	}
+
+	// Convert the extracted arguments into a MongoDB filter
+	filter := bson.M{}
+	for key, value := range toolCall.Parameters {
+		if value == "" {
+			continue
+		}
+		switch key {
+		case "artist", "album", "title", "genre":
+			// Use a case-insensitive regex for flexible matching
+			if strVal, ok := value.(string); ok {
+				filter[key] = primitive.Regex{Pattern: strVal, Options: "i"}
+			}
+		case "year":
+			// The model might return year as a number (float64) or a string.
+			// We need to handle both cases.
+			if floatVal, ok := value.(float64); ok {
+				filter["year"] = int(floatVal)
+			} else if strVal, ok := value.(string); ok {
+				if year, err := strconv.Atoi(strVal); err == nil {
+					filter["year"] = year
+				}
 			}
 		}
 	}
-	return nil
+
+	return filter, nil
 }
 
 /*
@@ -198,6 +366,7 @@ func findNamedCapture(text, pattern string) []string {
 dj "play songs by Queen"
 dj "play music from 1999"
 dj "play the song called \"Bohemian Rhapsody\""
+dj "play rock music by led zeppelin"
 dj "play songs by \"Daft Punk\" from the album \"Discovery\""
 */
 
