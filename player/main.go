@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -181,6 +182,12 @@ func main() {
 		return
 	}
 
+	// Randomize the playlist
+	log.Println("Shuffling playlist...")
+	rand.Shuffle(len(songs), func(i, j int) {
+		songs[i], songs[j] = songs[j], songs[i]
+	})
+
 	stats.mu.Lock()
 	stats.CommandsSucceeded++
 	stats.mu.Unlock()
@@ -196,6 +203,15 @@ func main() {
 
 	// Print stats at the end of a successful run or graceful shutdown.
 	printStatistics()
+}
+
+// killAllAfplay terminates every afplay process that might still be playing.
+func killAllAfplay() {
+	// Use pkill with SIGKILL (-9) to forcefully terminate all afplay processes.
+	// This ensures no old songs continue playing when a new command is issued.
+	// -f matches against the full command line.
+	cmd := exec.Command("pkill", "-9", "-f", "afplay")
+	_ = cmd.Run() // We don't care if nothing was running; ignore error.
 }
 
 // handleShutdown centralizes the shutdown logic.
@@ -225,6 +241,9 @@ func playSongs(songs []Song) {
 	}
 	speak(response)
 
+	// Ensure we start with no leftover afplay processes.
+	killAllAfplay()
+
 	var currentPlaybackCmd *exec.Cmd
 	var playbackDone = make(chan error, 1)
 
@@ -238,62 +257,182 @@ func playSongs(songs []Song) {
 		}
 
 		log.Printf("Playing (%d/%d): %s - %s (%s)", i+1, count, song.Artist, song.Title, song.ID)
-		currentPlaybackCmd = exec.Command("afplay", song.ID)
 
-		// Set a Process Group ID on the command. This allows us to kill the process
-		// and any of its children reliably, even if the main Go program's view of
-		// the process state is not yet updated.
+		// Kill any lingering afplay before starting the next song.
+		killAllAfplay()
+
+		currentPlaybackCmd = exec.Command("afplay", song.ID)
 		currentPlaybackCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-		// Run the song in a goroutine so we don't block.
 		startTime := time.Now()
+		if err := currentPlaybackCmd.Start(); err != nil {
+			log.Printf("Error starting afplay for %s: %v", song.ID, err)
+			continue
+		}
+
 		go func() {
-			playbackDone <- currentPlaybackCmd.Run()
+			playbackDone <- currentPlaybackCmd.Wait()
 		}()
 
-		// Wait for the song to finish, or for a control signal.
 		var err error
 		interrupted := false
+
 		select {
 		case <-shutdown:
 			log.Println("Playback interrupted by shutdown signal.")
 			if currentPlaybackCmd.Process != nil && currentPlaybackCmd.Process.Pid > 0 {
 				syscall.Kill(-currentPlaybackCmd.Process.Pid, syscall.SIGKILL)
+				currentPlaybackCmd.Wait()
 			}
 			return
+
 		case <-stopChan:
 			log.Println("Stopping playlist.")
 			if currentPlaybackCmd.Process != nil && currentPlaybackCmd.Process.Pid > 0 {
 				syscall.Kill(-currentPlaybackCmd.Process.Pid, syscall.SIGKILL)
+				currentPlaybackCmd.Wait()
 			}
 			return
+
 		case <-skipChan:
 			log.Println("Skipping to next song.")
 			if currentPlaybackCmd.Process != nil && currentPlaybackCmd.Process.Pid > 0 {
 				syscall.Kill(-currentPlaybackCmd.Process.Pid, syscall.SIGKILL)
+
+				// Wait briefly for process cleanup.
+				done := make(chan struct{})
+				go func() {
+					currentPlaybackCmd.Wait()
+					close(done)
+				}()
+				select {
+				case <-done:
+					log.Println("Previous afplay process exited cleanly.")
+				case <-time.After(500 * time.Millisecond):
+					log.Println("Timeout waiting for afplay to exit, forcing cleanup.")
+					exec.Command("pkill", "-9", "-f", "afplay").Run()
+				}
 			}
+
+			// Drain skip signals
+			for len(skipChan) > 0 {
+				<-skipChan
+			}
+
 			interrupted = true
-			// Continue to the next iteration of the loop.
 			continue
+
 		case err = <-playbackDone:
-			// Song finished normally.
+			// Song finished normally
 		}
 
 		playbackDuration := time.Since(startTime)
 
 		if err != nil && !interrupted {
-			// Log error only if it wasn't an intentional interruption.
 			log.Printf("Error playing %s: %v", song.ID, err)
 		} else if err == nil {
-			// Song completed successfully
 			stats.mu.Lock()
 			stats.SongsPlayed++
 			stats.TotalPlaybackTime += playbackDuration
 			stats.mu.Unlock()
 		}
 	}
+
 	log.Println("Playlist finished.")
 }
+
+// // playSongs iterates through a list of songs and plays them using `afplay`.
+// func playSongs(songs []Song) {
+// 	count := len(songs)
+// 	var response string
+// 	if count == 1 {
+// 		response = fmt.Sprintf("Now playing %s by %s.", songs[0].Title, songs[0].Artist)
+// 	} else {
+// 		response = fmt.Sprintf("Now playing %d songs.", count)
+// 	}
+// 	speak(response)
+
+// 	killAllAfplay() // <- guarantees a clean slate
+
+// 	var currentPlaybackCmd *exec.Cmd
+// 	var playbackDone = make(chan error, 1)
+
+// 	for i, song := range songs {
+// 		select {
+// 		case <-shutdown:
+// 			log.Println("Shutdown signal received, exiting playback loop.")
+// 			return
+// 		default:
+// 			// Continue to next song
+// 		}
+
+// 		log.Printf("Playing (%d/%d): %s - %s (%s)", i+1, count, song.Artist, song.Title, song.ID)
+// 		currentPlaybackCmd = exec.Command("afplay", song.ID)
+
+// 		// Set a Process Group ID on the command. This allows us to kill the process
+// 		// and any of its children reliably, even if the main Go program's view of
+// 		// the process state is not yet updated.
+// 		currentPlaybackCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+// 		// Run the song in a goroutine so we don't block.
+// 		startTime := time.Now()
+// 		if err := currentPlaybackCmd.Start(); err != nil {
+// 			log.Printf("Error starting afplay for %s: %v", song.ID, err)
+// 			continue // Skip to the next song
+// 		}
+
+// 		go func() {
+// 			playbackDone <- currentPlaybackCmd.Wait()
+// 		}()
+
+// 		// Wait for the song to finish, or for a control signal.
+// 		var err error
+// 		interrupted := false
+// 		select {
+// 		case <-shutdown:
+// 			log.Println("Playback interrupted by shutdown signal.")
+// 			if currentPlaybackCmd.Process != nil && currentPlaybackCmd.Process.Pid > 0 {
+// 				syscall.Kill(-currentPlaybackCmd.Process.Pid, syscall.SIGKILL)
+// 			}
+// 			return
+// 		case <-stopChan:
+// 			log.Println("Stopping playlist.")
+// 			if currentPlaybackCmd.Process != nil && currentPlaybackCmd.Process.Pid > 0 {
+// 				syscall.Kill(-currentPlaybackCmd.Process.Pid, syscall.SIGKILL)
+// 			}
+// 			return
+// 		case <-skipChan:
+// 			log.Println("Skipping to next song.")
+// 			if currentPlaybackCmd.Process != nil && currentPlaybackCmd.Process.Pid > 0 {
+// 				syscall.Kill(-currentPlaybackCmd.Process.Pid, syscall.SIGKILL)
+// 			}
+// 			// Drain the channel to prevent immediate re-skipping on the next song.
+// 			// This handles cases where multiple skip signals were received.
+// 			for len(skipChan) > 0 {
+// 				<-skipChan
+// 			}
+// 			interrupted = true
+// 			// Continue to the next iteration of the loop.
+// 			continue
+// 		case err = <-playbackDone:
+// 			// Song finished normally.
+// 		}
+
+// 		playbackDuration := time.Since(startTime)
+
+// 		if err != nil && !interrupted {
+// 			// Log error only if it wasn't an intentional interruption.
+// 			log.Printf("Error playing %s: %v", song.ID, err)
+// 		} else if err == nil {
+// 			// Song completed successfully
+// 			stats.mu.Lock()
+// 			stats.SongsPlayed++
+// 			stats.TotalPlaybackTime += playbackDuration
+// 			stats.mu.Unlock()
+// 		}
+// 	}
+// 	log.Println("Playlist finished.")
+// }
 
 // handleControlCommand sends a signal to the running player process.
 func handleControlCommand(command string) {
