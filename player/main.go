@@ -78,12 +78,24 @@ func main() {
 		speak("You need to provide a command.")
 		log.Fatalf("Usage: %s \"<command>\"", os.Args[0])
 	}
-	command := os.Args[1]
+
+	// Reconstruct the full command from all arguments
+	command := strings.Join(os.Args[1:], " ")
 	log.Printf("Received command: %q", command)
+	log.Printf("Checking if starts with 'list ': %v", strings.HasPrefix(command, "list "))
+
+	// Handle list commands
+	if strings.HasPrefix(command, "list ") {
+		log.Println("Routing to handleListCommand")
+		handleListCommand(command)
+		return
+	}
+
+	log.Println("Not a list command, continuing to normal flow")
 
 	// Dispatch control commands to a running player instance.
-	if command == "skip" || command == "stop" {
-		handleControlCommand(command)
+	if os.Args[1] == "skip" || os.Args[1] == "stop" {
+		handleControlCommand(os.Args[1])
 		return
 	}
 
@@ -194,6 +206,173 @@ func main() {
 	printStatistics()
 }
 
+func handleListCommand(command string) {
+	// Parse: "list artist <artist> [year]" or "list genre <genre> [year]"
+	parts := strings.Fields(command)
+	if len(parts) < 2 {
+		log.Fatalf("Invalid list command. Usage: list artist <name> [year] or list genre <name> [year]")
+	}
+
+	listType := parts[1] // "artist" or "genre"
+	if listType != "artist" && listType != "genre" {
+		log.Fatalf("Invalid list type: %s. Must be 'artist' or 'genre'", listType)
+	}
+
+	// If only "list genre" or "list artist" with no more args
+	if len(parts) < 3 {
+		log.Fatalf("Invalid list command. Usage: list artist <name> [year] or list genre <name> [year]")
+	}
+
+	// Extract the name (handle quoted names)
+	nameStart := strings.Index(command, parts[2])
+	remainder := command[nameStart:]
+
+	var name string
+	var yearStr string
+
+	// Check if the next token looks like a year (4 digits or range)
+	isYear := func(s string) bool {
+		// Check for year range (1983-1985)
+		if strings.Contains(s, "-") {
+			parts := strings.Split(s, "-")
+			if len(parts) == 2 {
+				_, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
+				_, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
+				return err1 == nil && err2 == nil
+			}
+		}
+		// Check for single year
+		if year, err := strconv.Atoi(s); err == nil && year >= 1000 && year <= 9999 {
+			return true
+		}
+		return false
+	}
+
+	// Check if name is quoted
+	if strings.HasPrefix(remainder, "\"") {
+		endQuote := strings.Index(remainder[1:], "\"")
+		if endQuote == -1 {
+			log.Fatalf("Unclosed quote in list command")
+		}
+		name = remainder[1 : endQuote+1]
+		if len(remainder) > endQuote+2 {
+			yearStr = strings.TrimSpace(remainder[endQuote+2:])
+		}
+	} else {
+		// Check if the first token is a year
+		tokens := strings.Fields(remainder)
+		if isYear(tokens[0]) {
+			// First token is a year, so no name filter
+			yearStr = tokens[0]
+			name = ""
+		} else {
+			// First token is the name
+			name = tokens[0]
+			if len(tokens) > 1 {
+				yearStr = tokens[1]
+			}
+		}
+	}
+
+	log.Printf("Parsed - listType: %s, name: %q, yearStr: %q", listType, name, yearStr)
+
+	// Connect to MongoDB
+	mongoUser := os.Getenv("MONGO_USER")
+	if mongoUser == "" {
+		mongoUser = "root"
+	}
+	mongoPass := os.Getenv("MONGO_PASS")
+	if mongoPass == "" {
+		mongoPass = "example"
+	}
+
+	uri := fmt.Sprintf("mongodb://%s:%s@localhost:27017", mongoUser, mongoPass)
+	mongoCtx, mongoCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer mongoCancel()
+
+	client, err := mongo.Connect(mongoCtx, options.Client().ApplyURI(uri))
+	if err != nil {
+		log.Fatalf("Failed to connect to MongoDB: %v", err)
+	}
+	defer client.Disconnect(context.Background())
+
+	collection := client.Database(dbName).Collection(collectionName)
+
+	// Build filter
+	filter := bson.M{}
+	if name != "" {
+		if listType == "artist" {
+			filter["artist"] = primitive.Regex{Pattern: name, Options: "i"}
+		} else {
+			filter["genre"] = primitive.Regex{Pattern: name, Options: "i"}
+		}
+	}
+	// If name is empty, we list all songs (optionally filtered by year)
+
+	// Handle year or year range
+	if yearStr != "" {
+		if strings.Contains(yearStr, "-") {
+			// Year range: 1982-1985
+			years := strings.Split(yearStr, "-")
+			if len(years) == 2 {
+				startYear, err1 := strconv.Atoi(strings.TrimSpace(years[0]))
+				endYear, err2 := strconv.Atoi(strings.TrimSpace(years[1]))
+				if err1 == nil && err2 == nil {
+					filter["year"] = bson.M{
+						"$gte": startYear,
+						"$lte": endYear,
+					}
+					log.Printf("Using year range filter: %d-%d", startYear, endYear)
+				}
+			}
+		} else {
+			// Single year
+			year, err := strconv.Atoi(strings.TrimSpace(yearStr))
+			if err == nil {
+				filter["year"] = year
+				log.Printf("Using year filter: %d", year)
+			} else {
+				log.Printf("Warning: could not parse year: %s", yearStr)
+			}
+		}
+	}
+
+	log.Printf("Generated filter: %+v", filter)
+
+	// Query with sorting
+	findOptions := options.Find()
+	findOptions.SetSort(bson.D{{Key: "year", Value: 1}, {Key: "artist", Value: 1}, {Key: "album", Value: 1}, {Key: "track_num", Value: 1}})
+
+	cursor, err := collection.Find(context.Background(), filter, findOptions)
+	if err != nil {
+		log.Fatalf("Failed to query MongoDB: %v", err)
+	}
+	defer cursor.Close(context.Background())
+
+	var songs []Song
+	if err = cursor.All(context.Background(), &songs); err != nil {
+		log.Fatalf("Failed to decode songs: %v", err)
+	}
+
+	if len(songs) == 0 {
+		log.Printf("No songs found matching criteria")
+		return
+	}
+
+	// Output TSV format
+	if listType == "artist" {
+		// Format: year\tartist\talbum\ttitle
+		for _, song := range songs {
+			fmt.Printf("%d\t%s\t%s\t%s\n", song.Year, song.Artist, song.Album, song.Title)
+		}
+	} else {
+		// Format: year\tgenre\tartist\talbum\ttitle
+		for _, song := range songs {
+			fmt.Printf("%d\t%s\t%s\t%s\t%s\n", song.Year, song.Genre, song.Artist, song.Album, song.Title)
+		}
+	}
+}
+
 func killAllAfplay() {
 	cmd := exec.Command("pkill", "-9", "-f", "afplay")
 	_ = cmd.Run()
@@ -252,7 +431,7 @@ func playSongs(songs []Song) {
 		}()
 
 		var err error
-		interrupted := false
+		skipped := false
 
 		select {
 		case <-shutdown:
@@ -290,25 +469,34 @@ func playSongs(songs []Song) {
 				}
 			}
 
+			// Drain any additional skip signals
 			for len(skipChan) > 0 {
 				<-skipChan
 			}
 
-			interrupted = true
-			continue
+			// Drain the playbackDone channel to consume the kill error
+			select {
+			case <-playbackDone:
+			case <-time.After(100 * time.Millisecond):
+			}
+
+			skipped = true
 
 		case err = <-playbackDone:
 		}
 
-		playbackDuration := time.Since(startTime)
+		// Only process playback results if the song wasn't skipped
+		if !skipped {
+			playbackDuration := time.Since(startTime)
 
-		if err != nil && !interrupted {
-			log.Printf("Error playing %s: %v", song.ID, err)
-		} else if err == nil {
-			stats.mu.Lock()
-			stats.SongsPlayed++
-			stats.TotalPlaybackTime += playbackDuration
-			stats.mu.Unlock()
+			if err != nil {
+				log.Printf("Error playing %s: %v", song.ID, err)
+			} else {
+				stats.mu.Lock()
+				stats.SongsPlayed++
+				stats.TotalPlaybackTime += playbackDuration
+				stats.mu.Unlock()
+			}
 		}
 	}
 
@@ -545,4 +733,13 @@ dj "play rock music by led zeppelin"
 dj "play songs by \"Daft Punk\" from the album \"Discovery\""
 dj "play music by other from 1982-1983"
 dj "play jazz from 1950 to 1960"
+
+--- List Commands (TSV output) ---
+dj "list artist Queen"
+dj "list artist \"Queen\" 1975"
+dj "list artist Queen 1975-1980"
+dj "list genre Rock"
+dj "list genre Jazz 1950-1960"
+dj "list genre 1983"
+dj "list artist 1983-1985"
 */
