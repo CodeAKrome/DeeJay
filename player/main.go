@@ -1,24 +1,26 @@
 package main
 
 import (
+	"bufio"
 	"context"
-	"encoding/json"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"os"
 	"os/exec"
-	"os/signal"
+	"path/filepath"
+	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
-	ollama "github.com/ollama/ollama/api"
+	"github.com/dhowden/tag"
+	"github.com/schollz/progressbar/v3"
 	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
@@ -26,102 +28,222 @@ import (
 const (
 	dbName         = "music"
 	collectionName = "songs"
-	pidFile        = "/tmp/dj.pid"
+	defaultWorkers = 8
 )
 
 // Song represents the structure of a music file's metadata in MongoDB.
 type Song struct {
-	ID     string `bson:"_id"` // File path
-	Title  string `bson:"title"`
-	Artist string `bson:"artist"`
-	Album  string `bson:"album"`
-	Genre  string `bson:"genre"`
-	Year   int    `bson:"year"`
+	ID          string    `bson:"_id"` // File path
+	Title       string    `bson:"title"`
+	Artist      string    `bson:"artist"`
+	Album       string    `bson:"album"`
+	AlbumArtist string    `bson:"album_artist"`
+	Composer    string    `bson:"composer"`
+	Genre       string    `bson:"genre"`
+	Year        int       `bson:"year"`
+	TrackNum    int       `bson:"track_num"`
+	TrackTotal  int       `bson:"track_total"`
+	DiscNum     int       `bson:"disc_num"`
+	DiscTotal   int       `bson:"disc_total"`
+	Lyrics      string    `bson:"lyrics,omitempty"`
+	Comment     string    `bson:"comment,omitempty"`
+	Format      string    `bson:"format"`
+	FileSize    int64     `bson:"file_size"`
+	FileHash    string    `bson:"file_hash"` // SHA256 hash of the file content
+	IndexedAt   time.Time `bson:"indexed_at"`
 }
 
-// PlayerStats holds statistics for the player session.
-type PlayerStats struct {
-	mu                sync.Mutex
-	StartTime         time.Time
-	CommandsProcessed int64
-	CommandsSucceeded int64
-	CommandsFailed    int64
-	SongsPlayed       int64
-	TotalPlaybackTime time.Duration
-}
-
-// Global variables for stats and shutdown signal.
-var stats = PlayerStats{StartTime: time.Now()}
-
-// Channels for playback control.
-var skipChan = make(chan struct{}, 1)
-var stopChan = make(chan struct{}, 1)
-
-// shutdown channel is now used for all forms of termination.
-var shutdown = make(chan struct{})
-
-// logFile is the file where logs will be written.
-var logFile *os.File
-
-func init() {
-	var err error
-	logFile, err = os.OpenFile("dj.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		log.Fatalf("FATAL: cannot open dj.log: %v", err)
-	}
-	log.SetOutput(io.MultiWriter(os.Stderr, logFile))
+// QueryCriteria represents parsed search criteria
+type QueryCriteria struct {
+	Genre     string
+	Artist    string
+	Album     string
+	Title     string
+	YearStart int
+	YearEnd   int
+	Decade    int
 }
 
 func main() {
-	defer logFile.Close()
 	if len(os.Args) < 2 {
-		speak("You need to provide a command.")
-		log.Fatalf("Usage: %s \"<command>\"", os.Args[0])
+		fmt.Println("Usage:")
+		fmt.Printf("  Index mode:  %s index <music_directory>\n", os.Args[0])
+		fmt.Printf("  Query mode:  %s query\n", os.Args[0])
+		os.Exit(1)
 	}
 
-	// Reconstruct the full command from all arguments
-	command := strings.Join(os.Args[1:], " ")
-	log.Printf("Received command: %q", command)
-	log.Printf("Checking if starts with 'list ': %v", strings.HasPrefix(command, "list "))
+	mode := os.Args[1]
 
-	// Handle list commands
-	if strings.HasPrefix(command, "list ") {
-		log.Println("Routing to handleListCommand")
-		handleListCommand(command)
+	switch mode {
+	case "index":
+		if len(os.Args) < 3 {
+			log.Fatalf("Usage: %s index <music_directory>", os.Args[0])
+		}
+		indexMusic(os.Args[2])
+	case "query":
+		queryMusic()
+	default:
+		log.Fatalf("Unknown mode: %s. Use 'index' or 'query'", mode)
+	}
+}
+
+func indexMusic(musicDir string) {
+	// --- MongoDB Connection ---
+	collection := connectToMongo()
+
+	// --- File Discovery ---
+	log.Printf("Scanning for music files in %s...", musicDir)
+	var filePaths []string
+	err := filepath.Walk(musicDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() && isMusicFile(path) {
+			filePaths = append(filePaths, path)
+		}
+		return nil
+	})
+	if err != nil {
+		log.Fatalf("Error walking directory: %v", err)
+	}
+
+	if len(filePaths) == 0 {
+		log.Println("No music files found.")
 		return
 	}
+	log.Printf("Found %d music files to process.", len(filePaths))
 
-	log.Println("Not a list command, continuing to normal flow")
+	// --- Parallel Processing Setup ---
+	numWorkers := runtime.NumCPU()
+	if numWorkers > defaultWorkers {
+		numWorkers = defaultWorkers
+	}
+	jobs := make(chan string, len(filePaths))
+	results := make(chan *Song, len(filePaths))
+	var wg sync.WaitGroup
 
-	// Dispatch control commands to a running player instance.
-	if os.Args[1] == "skip" || os.Args[1] == "stop" {
-		handleControlCommand(os.Args[1])
-		return
+	for w := 1; w <= numWorkers; w++ {
+		wg.Add(1)
+		go worker(w, jobs, results, &wg)
 	}
 
-	// Handle Ctrl-C for graceful shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGUSR1, syscall.SIGUSR2)
+	for _, path := range filePaths {
+		jobs <- path
+	}
+	close(jobs)
+
+	// --- Progress Bar and Result Collection ---
+	bar := progressbar.NewOptions(len(filePaths),
+		progressbar.OptionSetDescription("Processing files"),
+		progressbar.OptionSetWidth(40),
+		progressbar.OptionShowCount(),
+		progressbar.OptionEnableColorCodes(true),
+	)
+
+	var songsToInsert []interface{}
+	var processedCount int
+	done := make(chan struct{})
 	go func() {
-		for sig := range sigChan {
-			switch sig {
-			case syscall.SIGUSR1:
-				log.Println("Received skip signal (SIGUSR1).")
-				skipChan <- struct{}{}
-			case syscall.SIGUSR2:
-				log.Println("Received stop signal (SIGUSR2).")
-				stopChan <- struct{}{}
-			case os.Interrupt, syscall.SIGTERM:
-				handleShutdown()
+		for song := range results {
+			if song != nil {
+				songsToInsert = append(songsToInsert, song)
+			}
+			processedCount++
+			bar.Add(1)
+			if processedCount == len(filePaths) {
+				close(done)
+				return
 			}
 		}
 	}()
 
-	stats.mu.Lock()
-	stats.CommandsProcessed++
-	stats.mu.Unlock()
+	wg.Wait()
+	close(results)
+	<-done // Wait for result collection to finish
 
-	// --- MongoDB Connection ---
+	// --- Bulk Insert into MongoDB ---
+	if len(songsToInsert) > 0 {
+		log.Printf("\nInserting %d songs into MongoDB...", len(songsToInsert))
+		_, err := collection.DeleteMany(context.Background(), bson.D{}) // Clear collection before new import
+		if err != nil {
+			log.Fatalf("Failed to clear collection: %v", err)
+		}
+		_, err = collection.InsertMany(context.Background(), songsToInsert)
+		if err != nil {
+			log.Fatalf("Failed to insert songs: %v", err)
+		}
+		log.Println("Successfully inserted songs.")
+	}
+
+	// --- Create Indexes ---
+	log.Println("Creating database indexes...")
+	if err := createIndexes(collection); err != nil {
+		log.Fatalf("Failed to create indexes: %v", err)
+	}
+	log.Println("Indexes created successfully.")
+
+	// --- Find and Report Duplicates ---
+	log.Println("Finding duplicate files...")
+	if err := findAndReportDuplicates(collection); err != nil {
+		log.Fatalf("Failed to find duplicates: %v", err)
+	}
+}
+
+func queryMusic() {
+	collection := connectToMongo()
+
+	fmt.Println("\n=== DeeJay Music Query ===")
+	fmt.Println("Enter queries like:")
+	fmt.Println("  - play punk from the 1980s")
+	fmt.Println("  - play rock from 1995 to 2000")
+	fmt.Println("  - play jazz by Miles Davis")
+	fmt.Println("  - play songs from the 70s")
+	fmt.Println("Type 'quit' to exit\n")
+
+	scanner := bufio.NewScanner(os.Stdin)
+	for {
+		fmt.Print("> ")
+		if !scanner.Scan() {
+			break
+		}
+
+		query := strings.TrimSpace(scanner.Text())
+		if query == "" {
+			continue
+		}
+		if strings.ToLower(query) == "quit" || strings.ToLower(query) == "exit" {
+			break
+		}
+
+		criteria := parseQuery(query)
+		songs, err := searchSongs(collection, criteria)
+		if err != nil {
+			fmt.Printf("Error searching: %v\n", err)
+			continue
+		}
+
+		if len(songs) == 0 {
+			fmt.Println("No songs found matching your criteria.")
+			continue
+		}
+
+		fmt.Printf("\nFound %d songs:\n", len(songs))
+		for i, song := range songs {
+			fmt.Printf("%d. %s - %s (%d) [%s]\n", i+1, song.Artist, song.Title, song.Year, song.Genre)
+		}
+
+		fmt.Printf("\nPlay all? (y/n): ")
+		if !scanner.Scan() {
+			break
+		}
+		if strings.ToLower(strings.TrimSpace(scanner.Text())) == "y" {
+			playSongs(songs)
+		}
+		fmt.Println()
+	}
+}
+
+func connectToMongo() *mongo.Collection {
 	mongoUser := os.Getenv("MONGO_USER")
 	if mongoUser == "" {
 		mongoUser = "root"
@@ -132,614 +254,285 @@ func main() {
 	}
 
 	uri := fmt.Sprintf("mongodb://%s:%s@localhost:27017", mongoUser, mongoPass)
-	mongoCtx, mongoCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer mongoCancel()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
-	client, err := mongo.Connect(mongoCtx, options.Client().ApplyURI(uri))
+	client, err := mongo.Connect(ctx, options.Client().ApplyURI(uri))
 	if err != nil {
-		speak("I could not connect to the music database.")
 		log.Fatalf("Failed to connect to MongoDB: %v", err)
 	}
-	defer client.Disconnect(context.Background())
 
-	ollamaCtx, ollamaCancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer ollamaCancel()
-	collection := client.Database(dbName).Collection(collectionName)
+	log.Println("Successfully connected to MongoDB.")
+	return client.Database(dbName).Collection(collectionName)
+}
 
-	// --- Parse Command and Execute ---
-	filter, err := parseCommandWithOllama(ollamaCtx, command)
-	if err != nil {
-		stats.mu.Lock()
-		stats.CommandsFailed++
-		stats.mu.Unlock()
-		speak("Sorry, I had trouble understanding that.")
-		log.Printf("Ollama parsing error: %v", err)
-		return
-	}
-	if len(filter) == 0 {
-		speak("Sorry, I didn't understand that. Please try something like, play songs by Queen, or play music from 1999.")
-		return
+// parseQuery extracts search criteria from natural language queries
+func parseQuery(query string) QueryCriteria {
+	query = strings.ToLower(query)
+	criteria := QueryCriteria{}
+
+	// Extract genre (after "play" and before "from/by")
+	genrePattern := regexp.MustCompile(`play\s+(\w+(?:\s+\w+)?)\s+(?:from|by|in)`)
+	if matches := genrePattern.FindStringSubmatch(query); len(matches) > 1 {
+		criteria.Genre = strings.TrimSpace(matches[1])
 	}
 
-	findOptions := options.Find()
-	findOptions.SetSort(bson.D{{Key: "artist", Value: 1}, {Key: "year", Value: 1}, {Key: "album", Value: 1}, {Key: "track_num", Value: 1}})
+	// Extract artist (after "by")
+	artistPattern := regexp.MustCompile(`by\s+([a-z0-9\s]+?)(?:\s+from|\s+in|$)`)
+	if matches := artistPattern.FindStringSubmatch(query); len(matches) > 1 {
+		criteria.Artist = strings.TrimSpace(matches[1])
+	}
 
-	cursor, err := collection.Find(context.Background(), filter, findOptions)
+	// Extract decade patterns (1980s, 80s, the 80s, etc.)
+	decadePattern := regexp.MustCompile(`(?:the\s+)?(?:19)?([0-9])0s`)
+	if matches := decadePattern.FindStringSubmatch(query); len(matches) > 1 {
+		decade, _ := strconv.Atoi(matches[1])
+		if decade >= 5 && decade <= 9 {
+			criteria.Decade = 1900 + decade*10
+		} else if decade >= 0 && decade <= 2 {
+			criteria.Decade = 2000 + decade*10
+		}
+		criteria.YearStart = criteria.Decade
+		criteria.YearEnd = criteria.Decade + 9
+	}
+
+	// Extract year range (1995 to 2000, 1995-2000)
+	yearRangePattern := regexp.MustCompile(`(\d{4})\s+(?:to|-)\s+(\d{4})`)
+	if matches := yearRangePattern.FindStringSubmatch(query); len(matches) > 2 {
+		criteria.YearStart, _ = strconv.Atoi(matches[1])
+		criteria.YearEnd, _ = strconv.Atoi(matches[2])
+	}
+
+	// Extract single year (in 1995, from 1995)
+	if criteria.YearStart == 0 {
+		yearPattern := regexp.MustCompile(`(?:in|from)\s+(\d{4})`)
+		if matches := yearPattern.FindStringSubmatch(query); len(matches) > 1 {
+			year, _ := strconv.Atoi(matches[1])
+			criteria.YearStart = year
+			criteria.YearEnd = year
+		}
+	}
+
+	return criteria
+}
+
+// searchSongs queries MongoDB based on the parsed criteria
+func searchSongs(collection *mongo.Collection, criteria QueryCriteria) ([]Song, error) {
+	filter := bson.M{}
+
+	if criteria.Genre != "" {
+		filter["genre"] = bson.M{"$regex": criteria.Genre, "$options": "i"}
+	}
+
+	if criteria.Artist != "" {
+		filter["artist"] = bson.M{"$regex": criteria.Artist, "$options": "i"}
+	}
+
+	if criteria.YearStart > 0 && criteria.YearEnd > 0 {
+		filter["year"] = bson.M{
+			"$gte": criteria.YearStart,
+			"$lte": criteria.YearEnd,
+		}
+	}
+
+	cursor, err := collection.Find(context.Background(), filter)
 	if err != nil {
-		stats.mu.Lock()
-		stats.CommandsFailed++
-		stats.mu.Unlock()
-		speak("I had trouble searching for that music.")
-		log.Fatalf("Failed to query MongoDB: %v", err)
+		return nil, err
 	}
 	defer cursor.Close(context.Background())
 
 	var songs []Song
-	if err = cursor.All(context.Background(), &songs); err != nil {
-		stats.mu.Lock()
-		stats.CommandsFailed++
-		stats.mu.Unlock()
-		speak("I had trouble getting the song list.")
-		log.Fatalf("Failed to decode songs: %v", err)
+	if err := cursor.All(context.Background(), &songs); err != nil {
+		return nil, err
 	}
 
-	if len(songs) == 0 {
-		speak("I couldn't find any music matching your request.")
-		return
-	}
-
-	log.Println("Shuffling playlist...")
-	rand.Shuffle(len(songs), func(i, j int) {
-		songs[i], songs[j] = songs[j], songs[i]
-	})
-
-	stats.mu.Lock()
-	stats.CommandsSucceeded++
-	stats.mu.Unlock()
-
-	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0644); err != nil {
-		log.Printf("Warning: could not write PID file: %v", err)
-	}
-	defer os.Remove(pidFile)
-
-	playSongs(songs)
-	printStatistics()
+	return songs, nil
 }
 
-func handleListCommand(command string) {
-	// Parse: "list artist <artist> [year]" or "list genre <genre> [year]"
-	parts := strings.Fields(command)
-	if len(parts) < 2 {
-		log.Fatalf("Invalid list command. Usage: list artist <name> [year] or list genre <name> [year]")
-	}
+// playSongs attempts to play the songs using the system's default player
+func playSongs(songs []Song) {
+	for _, song := range songs {
+		fmt.Printf("Playing: %s - %s\n", song.Artist, song.Title)
 
-	listType := parts[1] // "artist" or "genre"
-	if listType != "artist" && listType != "genre" {
-		log.Fatalf("Invalid list type: %s. Must be 'artist' or 'genre'", listType)
-	}
-
-	// If only "list genre" or "list artist" with no more args
-	if len(parts) < 3 {
-		log.Fatalf("Invalid list command. Usage: list artist <name> [year] or list genre <name> [year]")
-	}
-
-	// Extract the name (handle quoted names)
-	nameStart := strings.Index(command, parts[2])
-	remainder := command[nameStart:]
-
-	var name string
-	var yearStr string
-
-	// Check if the next token looks like a year (4 digits or range)
-	isYear := func(s string) bool {
-		// Check for year range (1983-1985)
-		if strings.Contains(s, "-") {
-			parts := strings.Split(s, "-")
-			if len(parts) == 2 {
-				_, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
-				_, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
-				return err1 == nil && err2 == nil
+		// Try to find an available media player
+		var cmd *exec.Cmd
+		switch runtime.GOOS {
+		case "darwin": // macOS
+			cmd = exec.Command("afplay", song.ID)
+		case "linux":
+			// Try common Linux players
+			if _, err := exec.LookPath("mpg123"); err == nil {
+				cmd = exec.Command("mpg123", song.ID)
+			} else if _, err := exec.LookPath("ffplay"); err == nil {
+				cmd = exec.Command("ffplay", "-nodisp", "-autoexit", song.ID)
 			}
+		case "windows":
+			cmd = exec.Command("cmd", "/C", "start", song.ID)
 		}
-		// Check for single year
-		if year, err := strconv.Atoi(s); err == nil && year >= 1000 && year <= 9999 {
-			return true
+
+		if cmd != nil {
+			if err := cmd.Run(); err != nil {
+				fmt.Printf("Error playing %s: %v\n", song.ID, err)
+			}
+		} else {
+			fmt.Println("No suitable media player found. Install mpg123 or ffplay.")
+			return
 		}
+	}
+}
+
+// worker processes files from the jobs channel and sends results to the results channel.
+func worker(id int, jobs <-chan string, results chan<- *Song, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for path := range jobs {
+		file, err := os.Open(path)
+		if err != nil {
+			log.Printf("Worker %d: Error opening %s: %v", id, path, err)
+			results <- nil
+			continue
+		}
+
+		meta, err := tag.ReadFrom(file)
+		if err != nil {
+			log.Printf("Worker %d: Error reading tags from %s: %v", id, path, err)
+			file.Close()
+			results <- nil
+			continue
+		}
+
+		// Reset file pointer to calculate hash from the beginning
+		file.Seek(0, 0)
+		hash, fileSize, err := calculateHashAndSize(file)
+		if err != nil {
+			log.Printf("Worker %d: Error hashing %s: %v", id, path, err)
+			file.Close()
+			results <- nil
+			continue
+		}
+		file.Close()
+
+		trackNum, trackTotal := meta.Track()
+		discNum, discTotal := meta.Disc()
+
+		song := &Song{
+			ID:          path,
+			Title:       meta.Title(),
+			Artist:      meta.Artist(),
+			Album:       meta.Album(),
+			AlbumArtist: meta.AlbumArtist(),
+			Composer:    meta.Composer(),
+			Genre:       meta.Genre(),
+			Year:        meta.Year(),
+			TrackNum:    trackNum,
+			TrackTotal:  trackTotal,
+			DiscNum:     discNum,
+			DiscTotal:   discTotal,
+			Lyrics:      meta.Lyrics(),
+			Comment:     meta.Comment(),
+			Format:      string(meta.Format()),
+			FileSize:    fileSize,
+			FileHash:    hash,
+			IndexedAt:   time.Now().UTC(),
+		}
+		results <- song
+	}
+}
+
+// isMusicFile checks if a file has a common music file extension.
+func isMusicFile(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".mp3", ".m4a", ".flac", ".ogg", ".wav", ".aac":
+		return true
+	default:
 		return false
 	}
+}
 
-	// Check if name is quoted
-	if strings.HasPrefix(remainder, "\"") {
-		endQuote := strings.Index(remainder[1:], "\"")
-		if endQuote == -1 {
-			log.Fatalf("Unclosed quote in list command")
-		}
-		name = remainder[1 : endQuote+1]
-		if len(remainder) > endQuote+2 {
-			yearStr = strings.TrimSpace(remainder[endQuote+2:])
-		}
-	} else {
-		// Check if the first token is a year
-		tokens := strings.Fields(remainder)
-		if isYear(tokens[0]) {
-			// First token is a year, so no name filter
-			yearStr = tokens[0]
-			name = ""
-		} else {
-			// First token is the name
-			name = tokens[0]
-			if len(tokens) > 1 {
-				yearStr = tokens[1]
-			}
-		}
-	}
-
-	log.Printf("Parsed - listType: %s, name: %q, yearStr: %q", listType, name, yearStr)
-
-	// Connect to MongoDB
-	mongoUser := os.Getenv("MONGO_USER")
-	if mongoUser == "" {
-		mongoUser = "root"
-	}
-	mongoPass := os.Getenv("MONGO_PASS")
-	if mongoPass == "" {
-		mongoPass = "example"
-	}
-
-	uri := fmt.Sprintf("mongodb://%s:%s@localhost:27017", mongoUser, mongoPass)
-	mongoCtx, mongoCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer mongoCancel()
-
-	client, err := mongo.Connect(mongoCtx, options.Client().ApplyURI(uri))
+// calculateHashAndSize computes the SHA256 hash and size of a file.
+func calculateHashAndSize(r io.Reader) (string, int64, error) {
+	hasher := sha256.New()
+	size, err := io.Copy(hasher, r)
 	if err != nil {
-		log.Fatalf("Failed to connect to MongoDB: %v", err)
+		return "", 0, err
 	}
-	defer client.Disconnect(context.Background())
+	return hex.EncodeToString(hasher.Sum(nil)), size, nil
+}
 
-	collection := client.Database(dbName).Collection(collectionName)
-
-	// Build filter
-	filter := bson.M{}
-	if name != "" {
-		if listType == "artist" {
-			filter["artist"] = primitive.Regex{Pattern: name, Options: "i"}
-		} else {
-			filter["genre"] = primitive.Regex{Pattern: name, Options: "i"}
-		}
+// createIndexes sets up the necessary indexes in the MongoDB collection for efficient searching.
+func createIndexes(collection *mongo.Collection) error {
+	models := []mongo.IndexModel{
+		{Keys: bson.D{{Key: "artist", Value: 1}}},
+		{Keys: bson.D{{Key: "title", Value: 1}}},
+		{Keys: bson.D{{Key: "year", Value: 1}}},
+		{Keys: bson.D{{Key: "genre", Value: 1}}},
+		{Keys: bson.D{{Key: "file_hash", Value: 1}}}, // For finding duplicates
 	}
-	// If name is empty, we list all songs (optionally filtered by year)
+	_, err := collection.Indexes().CreateMany(context.Background(), models)
+	return err
+}
 
-	// Handle year or year range
-	if yearStr != "" {
-		if strings.Contains(yearStr, "-") {
-			// Year range: 1982-1985
-			years := strings.Split(yearStr, "-")
-			if len(years) == 2 {
-				startYear, err1 := strconv.Atoi(strings.TrimSpace(years[0]))
-				endYear, err2 := strconv.Atoi(strings.TrimSpace(years[1]))
-				if err1 == nil && err2 == nil {
-					filter["year"] = bson.M{
-						"$gte": startYear,
-						"$lte": endYear,
-					}
-					log.Printf("Using year range filter: %d-%d", startYear, endYear)
-				}
-			}
-		} else {
-			// Single year
-			year, err := strconv.Atoi(strings.TrimSpace(yearStr))
-			if err == nil {
-				filter["year"] = year
-				log.Printf("Using year filter: %d", year)
-			} else {
-				log.Printf("Warning: could not parse year: %s", yearStr)
-			}
-		}
+// findAndReportDuplicates queries MongoDB for files with the same hash and writes them to a TSV file.
+func findAndReportDuplicates(collection *mongo.Collection) error {
+	pipeline := mongo.Pipeline{
+		bson.D{{Key: "$group", Value: bson.D{
+			{Key: "_id", Value: "$file_hash"},
+			{Key: "paths", Value: bson.D{{Key: "$push", Value: "$_id"}}},
+			{Key: "sizes", Value: bson.D{{Key: "$push", Value: "$file_size"}}},
+			{Key: "count", Value: bson.D{{Key: "$sum", Value: 1}}},
+		}}},
+		bson.D{{Key: "$match", Value: bson.D{
+			{Key: "count", Value: bson.D{{Key: "$gt", Value: 1}}},
+		}}},
 	}
 
-	log.Printf("Generated filter: %+v", filter)
-
-	// Query with sorting
-	findOptions := options.Find()
-	findOptions.SetSort(bson.D{{Key: "year", Value: 1}, {Key: "artist", Value: 1}, {Key: "album", Value: 1}, {Key: "track_num", Value: 1}})
-
-	cursor, err := collection.Find(context.Background(), filter, findOptions)
+	cursor, err := collection.Aggregate(context.Background(), pipeline)
 	if err != nil {
-		log.Fatalf("Failed to query MongoDB: %v", err)
+		return fmt.Errorf("aggregation failed: %w", err)
 	}
 	defer cursor.Close(context.Background())
 
-	var songs []Song
-	if err = cursor.All(context.Background(), &songs); err != nil {
-		log.Fatalf("Failed to decode songs: %v", err)
+	outFile, err := os.Create("duplicates.tsv")
+	if err != nil {
+		return fmt.Errorf("failed to create duplicates.tsv: %w", err)
+	}
+	defer outFile.Close()
+
+	// Write TSV header
+	_, err = outFile.WriteString("file_hash\tfile_size\tfile_path\n")
+	if err != nil {
+		return err
 	}
 
-	if len(songs) == 0 {
-		log.Printf("No songs found matching criteria")
-		return
-	}
-
-	// Output TSV format
-	if listType == "artist" {
-		// Format: year\tartist\talbum\ttitle
-		for _, song := range songs {
-			fmt.Printf("%d\t%s\t%s\t%s\n", song.Year, song.Artist, song.Album, song.Title)
+	foundDuplicates := false
+	for cursor.Next(context.Background()) {
+		foundDuplicates = true
+		var result struct {
+			Hash  string   `bson:"_id"`
+			Paths []string `bson:"paths"`
+			Sizes []int64  `bson:"sizes"`
 		}
+		if err := cursor.Decode(&result); err != nil {
+			log.Printf("Error decoding duplicate result: %v", err)
+			continue
+		}
+
+		for i, path := range result.Paths {
+			line := fmt.Sprintf("%s\t%d\t%s\n", result.Hash, result.Sizes[i], path)
+			if _, err := outFile.WriteString(line); err != nil {
+				log.Printf("Error writing to duplicates.tsv: %v", err)
+			}
+		}
+	}
+
+	if !foundDuplicates {
+		log.Println("No duplicate files found.")
+		// Clean up empty file
+		outFile.Close()
+		os.Remove("duplicates.tsv")
 	} else {
-		// Format: year\tgenre\tartist\talbum\ttitle
-		for _, song := range songs {
-			fmt.Printf("%d\t%s\t%s\t%s\t%s\n", song.Year, song.Genre, song.Artist, song.Album, song.Title)
-		}
+		log.Println("Duplicate file report saved to duplicates.tsv")
 	}
+
+	return cursor.Err()
 }
-
-func killAllAfplay() {
-	cmd := exec.Command("pkill", "-9", "-f", "afplay")
-	_ = cmd.Run()
-}
-
-func handleShutdown() {
-	log.Println("\nReceived interrupt signal. Stopping playback...")
-	speak("Stopping playback.")
-	close(shutdown)
-}
-
-func speak(text string) {
-	log.Printf("SAY: %s", text)
-	fmt.Println(text)
-	cmd := exec.Command("say", text)
-	cmd.Run()
-}
-
-func playSongs(songs []Song) {
-	count := len(songs)
-	var response string
-	if count == 1 {
-		response = fmt.Sprintf("Now playing %s by %s.", songs[0].Title, songs[0].Artist)
-	} else {
-		response = fmt.Sprintf("Now playing %d songs.", count)
-	}
-	speak(response)
-
-	killAllAfplay()
-
-	var currentPlaybackCmd *exec.Cmd
-	var playbackDone = make(chan error, 1)
-
-	for i, song := range songs {
-		select {
-		case <-shutdown:
-			log.Println("Shutdown signal received, exiting playback loop.")
-			return
-		default:
-		}
-
-		log.Printf("Playing (%d/%d): %s - %s (%s)", i+1, count, song.Artist, song.Title, song.ID)
-		killAllAfplay()
-
-		currentPlaybackCmd = exec.Command("afplay", song.ID)
-		currentPlaybackCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
-		startTime := time.Now()
-		if err := currentPlaybackCmd.Start(); err != nil {
-			log.Printf("Error starting afplay for %s: %v", song.ID, err)
-			continue
-		}
-
-		go func() {
-			playbackDone <- currentPlaybackCmd.Wait()
-		}()
-
-		var err error
-		skipped := false
-
-		select {
-		case <-shutdown:
-			log.Println("Playback interrupted by shutdown signal.")
-			if currentPlaybackCmd.Process != nil && currentPlaybackCmd.Process.Pid > 0 {
-				syscall.Kill(-currentPlaybackCmd.Process.Pid, syscall.SIGKILL)
-				currentPlaybackCmd.Wait()
-			}
-			return
-
-		case <-stopChan:
-			log.Println("Stopping playlist.")
-			if currentPlaybackCmd.Process != nil && currentPlaybackCmd.Process.Pid > 0 {
-				syscall.Kill(-currentPlaybackCmd.Process.Pid, syscall.SIGKILL)
-				currentPlaybackCmd.Wait()
-			}
-			return
-
-		case <-skipChan:
-			log.Println("Skipping to next song.")
-			if currentPlaybackCmd.Process != nil && currentPlaybackCmd.Process.Pid > 0 {
-				syscall.Kill(-currentPlaybackCmd.Process.Pid, syscall.SIGKILL)
-
-				done := make(chan struct{})
-				go func() {
-					currentPlaybackCmd.Wait()
-					close(done)
-				}()
-				select {
-				case <-done:
-					log.Println("Previous afplay process exited cleanly.")
-				case <-time.After(500 * time.Millisecond):
-					log.Println("Timeout waiting for afplay to exit, forcing cleanup.")
-					exec.Command("pkill", "-9", "-f", "afplay").Run()
-				}
-			}
-
-			// Drain any additional skip signals
-			for len(skipChan) > 0 {
-				<-skipChan
-			}
-
-			// Drain the playbackDone channel to consume the kill error
-			select {
-			case <-playbackDone:
-			case <-time.After(100 * time.Millisecond):
-			}
-
-			skipped = true
-
-		case err = <-playbackDone:
-		}
-
-		// Only process playback results if the song wasn't skipped
-		if !skipped {
-			playbackDuration := time.Since(startTime)
-
-			if err != nil {
-				log.Printf("Error playing %s: %v", song.ID, err)
-			} else {
-				stats.mu.Lock()
-				stats.SongsPlayed++
-				stats.TotalPlaybackTime += playbackDuration
-				stats.mu.Unlock()
-			}
-		}
-	}
-
-	log.Println("Playlist finished.")
-}
-
-func handleControlCommand(command string) {
-	pidBytes, err := os.ReadFile(pidFile)
-	if err != nil {
-		log.Fatalf("Could not read PID file. Is a song playing? Error: %v", err)
-	}
-
-	pid, err := strconv.Atoi(string(pidBytes))
-	if err != nil {
-		log.Fatalf("Invalid PID found in PID file: %v", err)
-	}
-
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		log.Fatalf("Could not find running player process with PID %d: %v", pid, err)
-	}
-
-	var sig syscall.Signal
-	switch command {
-	case "skip":
-		sig = syscall.SIGUSR1
-		speak("Skipping.")
-	case "stop":
-		sig = syscall.SIGUSR2
-		speak("Stopping.")
-	default:
-		log.Fatalf("Unknown control command: %s", command)
-	}
-
-	if err := process.Signal(sig); err != nil {
-		log.Fatalf("Failed to send %s signal to process %d: %v", command, pid, err)
-	}
-
-	log.Printf("Successfully sent %s signal to process %d.", command, pid)
-}
-
-func printStatistics() {
-	stats.mu.Lock()
-	defer stats.mu.Unlock()
-
-	fmt.Printf("\n--- Playback Session Statistics ---\n")
-	fmt.Printf("  Session Duration:   %v\n", time.Since(stats.StartTime).Round(time.Second))
-	fmt.Printf("  Commands Processed: %d\n", stats.CommandsProcessed)
-	fmt.Printf("  - Succeeded:        %d\n", stats.CommandsSucceeded)
-	fmt.Printf("  - Failed:           %d\n", stats.CommandsFailed)
-	fmt.Printf("  Songs Completed:    %d\n", stats.SongsPlayed)
-	fmt.Printf("  Total Playback Time: %v\n", stats.TotalPlaybackTime.Round(time.Second))
-	fmt.Println("-----------------------------------")
-}
-
-const toolDefinition = `
-{
-  "name": "create_playlist",
-  "description": "Create a playlist based on user specifications for artist, album, title, genre, or year/year range.",
-  "parameters": {
-    "type": "object",
-    "properties": {
-      "artist": {
-        "type": "string",
-        "description": "The name of the artist or band."
-      },
-      "album": {
-        "type": "string",
-        "description": "The name of the album."
-      },
-      "title": {
-        "type": "string",
-        "description": "The title of the song."
-      },
-      "genre": {
-        "type": "string",
-        "description": "The genre of the music, for example 'Rock', 'Pop', or 'Jazz'."
-      },
-      "year_start": {
-        "type": "number",
-        "description": "The starting year for a year range, or the specific year if no end year is given."
-      },
-      "year_end": {
-        "type": "number",
-        "description": "The ending year for a year range. Only include if the user specifies a range."
-      }
-    },
-    "required": []
-  }
-}
-`
-
-func parseCommandWithOllama(ctx context.Context, command string) (bson.M, error) {
-	client, err := ollama.ClientFromEnvironment()
-	if err != nil {
-		return nil, fmt.Errorf("could not create ollama client: %w", err)
-	}
-
-	prompt := fmt.Sprintf(`You are a music selection assistant. Analyze the user's request and respond with ONLY a JSON object in this exact format:
-
-{
-  "name": "create_playlist",
-  "parameters": {
-    "artist": "artist name here or empty string",
-    "album": "album name here or empty string",
-    "title": "song title here or empty string",
-    "genre": "genre here or empty string",
-    "year_start": year_number_or_null,
-    "year_end": year_number_or_null
-  }
-}
-
-Rules:
-- Use empty strings ("") for text fields that aren't specified
-- Use null for year fields that aren't specified
-- If a year range is given (like 1982-1983), put the first year in year_start and second in year_end
-- If only one year is given, put it in year_start and leave year_end as null
-- Do not include any other text, explanations, or formatting
-
-User request: '%s'`, command)
-
-	req := &ollama.GenerateRequest{
-		Model:  "llama3.1:8b",
-		Prompt: prompt,
-		Format: json.RawMessage(`"json"`),
-		System: "You are a JSON formatter. Output only valid JSON matching the requested schema. No explanations.",
-	}
-
-	var responseText string
-	respFunc := func(resp ollama.GenerateResponse) error {
-		responseText += resp.Response
-		return nil
-	}
-
-	err = client.Generate(ctx, req, respFunc)
-	if err != nil {
-		return nil, fmt.Errorf("ollama generation failed: %w", err)
-	}
-
-	log.Printf("Ollama raw response: %s", responseText)
-
-	var toolCall struct {
-		Name       string                 `json:"name"`
-		Parameters map[string]interface{} `json:"parameters"`
-	}
-
-	cleanedJSON := strings.Trim(responseText, " \n\t`")
-	if strings.HasPrefix(cleanedJSON, "json") {
-		cleanedJSON = strings.TrimPrefix(cleanedJSON, "json")
-	}
-	cleanedJSON = strings.Trim(cleanedJSON, " \n\t`")
-
-	if err := json.Unmarshal([]byte(cleanedJSON), &toolCall); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal ollama response: %w. Response was: %s", err, cleanedJSON)
-	}
-
-	if toolCall.Name != "create_playlist" || toolCall.Parameters == nil {
-		return nil, fmt.Errorf("model did not return a valid create_playlist tool call. Received: %s", cleanedJSON)
-	}
-
-	filter := bson.M{}
-
-	for key, value := range toolCall.Parameters {
-		if value == nil || value == "" {
-			continue
-		}
-
-		switch key {
-		case "artist", "album", "title", "genre":
-			if strVal, ok := value.(string); ok && strVal != "" {
-				filter[key] = primitive.Regex{Pattern: strVal, Options: "i"}
-			}
-		case "year_start":
-			var yearStart int
-			if floatVal, ok := value.(float64); ok {
-				yearStart = int(floatVal)
-			} else if strVal, ok := value.(string); ok {
-				if y, err := strconv.Atoi(strVal); err == nil {
-					yearStart = y
-				}
-			}
-
-			if yearStart > 0 {
-				// Check if we also have year_end
-				if yearEndVal, hasEnd := toolCall.Parameters["year_end"]; hasEnd && yearEndVal != nil {
-					var yearEnd int
-					if floatVal, ok := yearEndVal.(float64); ok {
-						yearEnd = int(floatVal)
-					} else if strVal, ok := yearEndVal.(string); ok {
-						if y, err := strconv.Atoi(strVal); err == nil {
-							yearEnd = y
-						}
-					}
-
-					if yearEnd > 0 {
-						// Year range query
-						filter["year"] = bson.M{
-							"$gte": yearStart,
-							"$lte": yearEnd,
-						}
-						log.Printf("Using year range filter: %d-%d", yearStart, yearEnd)
-					} else {
-						// Just start year
-						filter["year"] = yearStart
-					}
-				} else {
-					// Just start year
-					filter["year"] = yearStart
-				}
-			}
-		case "year_end":
-			// Already handled in year_start case
-			continue
-		}
-	}
-
-	log.Printf("Generated MongoDB filter: %+v", filter)
-	return filter, nil
-}
-
-/*
---- How to Build and Install ---
-1. cd /Users/kyle/hub/DeeJay/player
-2. go build .
-3. sudo mv player /usr/local/bin/dj
-
---- Example Commands ---
-dj "play songs by Queen"
-dj "play music from 1999"
-dj "play music from 1982 to 1985"
-dj "play rock music from the 80s"
-dj "play the song called \"Bohemian Rhapsody\""
-dj "play rock music by led zeppelin"
-dj "play songs by \"Daft Punk\" from the album \"Discovery\""
-dj "play music by other from 1982-1983"
-dj "play jazz from 1950 to 1960"
-
---- List Commands (TSV output) ---
-dj "list artist Queen"
-dj "list artist \"Queen\" 1975"
-dj "list artist Queen 1975-1980"
-dj "list genre Rock"
-dj "list genre Jazz 1950-1960"
-dj "list genre 1983"
-dj "list artist 1983-1985"
-*/
