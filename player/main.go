@@ -68,32 +68,66 @@ type QueryCriteria struct {
 	Decade    int
 }
 
-func main() {
-	randomize := false
-	if len(os.Args) > 1 && (os.Args[1] == "-r" || os.Args[1] == "-random") {
-		randomize = true
-		os.Args = append([]string{os.Args[0]}, os.Args[2:]...)
-	}
+func printHelp() {
+	fmt.Printf("Usage: %s <command> [options]\n\n", os.Args[0])
+	fmt.Println("Commands:")
+	fmt.Println("  index <music_directory>   Scan a directory and index music files into the database.")
+	fmt.Println("  query [\"query string\"]    Start interactive query mode or run a single query.")
+	fmt.Println("  skip                      Skip the currently playing song.")
+	fmt.Println("  stop                      Stop playback and exit the player.")
+	fmt.Println("  help                      Show this help message.")
+	fmt.Println("\nOptions for 'query':")
+	fmt.Println("  -r, -random               Randomize the playlist before playing.")
+	fmt.Println("\nExamples:")
+	fmt.Printf("  %s index /path/to/my/music\n", os.Args[0])
+	fmt.Printf("  %s query\n", os.Args[0])
+	fmt.Printf("  %s query \"play rock from the 90s\"\n", os.Args[0])
+	fmt.Printf("  %s -r query \"play jazz by miles davis\"\n", os.Args[0])
+	fmt.Printf("  %s skip\n", os.Args[0])
+}
 
+func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage:")
-		fmt.Printf("  Index :  %s index  <music_directory>\n", os.Args[0])
-		fmt.Printf("  Query :  %s [-r] query [\"natural language query\"]\n", os.Args[0])
-		fmt.Printf("  Ctrl  :  %s skip|stop\n", os.Args[0])
+		printHelp()
 		os.Exit(1)
 	}
 
-	mode := os.Args[1]
-	switch mode {
+	randomize := false
+	rawArgs := os.Args[1:]
+	args := make([]string, 0, len(rawArgs))
+	for _, arg := range rawArgs {
+		if arg == "-r" || arg == "-random" {
+			randomize = true
+		} else {
+			args = append(args, arg)
+		}
+	}
+
+	// Seed the random number generator if we're randomizing.
+	if randomize {
+		rand.Seed(time.Now().UnixNano())
+	}
+	if len(args) == 0 {
+		printHelp()
+		os.Exit(1)
+	}
+
+	mode := args[0]
+	if mode == "help" || mode == "-h" || mode == "--help" {
+		printHelp()
+		return
+	}
+
+	switch args[0] {
 	case "index":
-		if len(os.Args) < 3 {
+		if len(args) < 2 {
 			log.Fatalf("Usage: %s index <music_directory>", os.Args[0])
 		}
-		indexMusic(os.Args[2])
+		indexMusic(args[1])
 	case "query":
 		cliQuery := ""
-		if len(os.Args) > 2 {
-			cliQuery = strings.Join(os.Args[2:], " ")
+		if len(args) > 1 {
+			cliQuery = strings.Join(args[1:], " ")
 		}
 		queryMusic(cliQuery, randomize)
 	case "skip":
@@ -101,7 +135,7 @@ func main() {
 	case "stop":
 		sendCommand("stop")
 	default:
-		log.Fatalf("Unknown mode: %s", mode)
+		log.Fatalf("Unknown mode: %s", args[0])
 	}
 }
 
