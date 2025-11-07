@@ -98,13 +98,11 @@ func main() {
 	rawArgs := os.Args[1:]
 	args := make([]string, 0, len(rawArgs))
 
-	// Manual flag parsing to handle flags before the command
-	i := 0
-	for i < len(rawArgs) {
+	// Manual flag parsing to handle flags anywhere in arguments
+	for i := 0; i < len(rawArgs); i++ {
 		arg := rawArgs[i]
 		if arg == "-r" || arg == "--random" {
 			randomize = true
-			i++
 		} else if arg == "-l" || arg == "--limit" {
 			if i+1 < len(rawArgs) {
 				if val, err := strconv.Atoi(rawArgs[i+1]); err == nil {
@@ -112,9 +110,8 @@ func main() {
 				}
 				i++
 			}
-			i++
 		} else {
-			args = append(args, rawArgs[i:]...)
+			args = append(args, arg)
 		}
 	}
 
@@ -236,6 +233,8 @@ func queryMusic(cliQuery string, randomize bool, limit int) {
 	defer os.Remove(pidFile)
 	defer os.Remove(commandFile)
 
+	nonInteractive := cliQuery != ""
+
 	if cliQuery == "" {
 		fmt.Println("\n=== DeeJay Music Query ===")
 		fmt.Println("Enter queries like:")
@@ -251,7 +250,6 @@ func queryMusic(cliQuery string, randomize bool, limit int) {
 		var query string
 		if cliQuery != "" {
 			query = cliQuery
-			cliQuery = ""
 		} else {
 			fmt.Print("> ")
 			if !scanner.Scan() {
@@ -280,6 +278,7 @@ func queryMusic(cliQuery string, randomize bool, limit int) {
 			rand.Shuffle(len(songs), func(i, j int) { songs[i], songs[j] = songs[j], songs[i] })
 		}
 		if limit > 0 && len(songs) > limit {
+			log.Printf("Limiting playlist from %d to %d songs", len(songs), limit)
 			songs = songs[:limit]
 		}
 
@@ -287,7 +286,7 @@ func queryMusic(cliQuery string, randomize bool, limit int) {
 		summarizePlaylist(songs)
 
 		// Skip confirmation if -r is used or if it's a direct CLI query
-		shouldPlay := randomize || cliQuery != ""
+		shouldPlay := randomize || nonInteractive
 
 		if !shouldPlay {
 			fmt.Printf("\nPlay all? (y/n): ")
@@ -300,10 +299,8 @@ func queryMusic(cliQuery string, randomize bool, limit int) {
 				continue
 			}
 		}
-		playSongs(songs)
-		if cliQuery == "" {
-			fmt.Println()
-		} else {
+		playSongs(songs, nonInteractive)
+		if nonInteractive {
 			break
 		}
 	}
@@ -428,19 +425,25 @@ func sendCommand(cmd string) {
 }
 
 /* ---------- playback ---------- */
-func playSongs(songs []Song) {
+func playSongs(songs []Song, nonInteractive bool) {
 	fmt.Println("\nControls: Press 's' to skip, 'q' to stop playback")
 	fmt.Println("Or use './dj skip' or './dj stop' from another terminal")
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGUSR1)
+
 	inputChan := make(chan string, 1)
-	go func() {
-		sc := bufio.NewScanner(os.Stdin)
-		for sc.Scan() {
-			inputChan <- strings.ToLower(strings.TrimSpace(sc.Text()))
-		}
-	}()
+	quitInput := make(chan struct{})
+	if !nonInteractive {
+		go func() {
+			sc := bufio.NewScanner(os.Stdin)
+			for sc.Scan() {
+				inputChan <- strings.ToLower(strings.TrimSpace(sc.Text()))
+			}
+			close(quitInput)
+		}()
+	}
+
 	commandChan := make(chan string, 1)
 	go func() {
 		for range sigChan {
@@ -505,6 +508,10 @@ func playSongs(songs []Song) {
 		}
 	}
 	signal.Stop(sigChan)
+	if !nonInteractive {
+		// Close stdin to unblock the scanner goroutine
+		os.Stdin.Close()
+	}
 	fmt.Println("\n✓ Playback finished")
 }
 
