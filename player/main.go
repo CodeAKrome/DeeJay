@@ -102,10 +102,10 @@ func main() {
 	i := 0
 	for i < len(rawArgs) {
 		arg := rawArgs[i]
-		if arg == "-r" || arg == "-random" {
+		if arg == "-r" || arg == "--random" {
 			randomize = true
 			i++
-		} else if arg == "--limit" {
+		} else if arg == "-l" || arg == "--limit" {
 			if i+1 < len(rawArgs) {
 				if val, err := strconv.Atoi(rawArgs[i+1]); err == nil {
 					limit = val
@@ -115,7 +115,6 @@ func main() {
 			i++
 		} else {
 			args = append(args, rawArgs[i:]...)
-			break
 		}
 	}
 
