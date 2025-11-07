@@ -452,7 +452,7 @@ func queryMusic(cliQuery string, randomize bool, limit int) {
 				continue
 			}
 		}
-		playSongs(songs, nonInteractive)
+		playSongs(songs, playbackControlChan)
 		if nonInteractive {
 			break
 		}
@@ -586,18 +586,224 @@ func sendCommand(cmd string) {
 }
 
 /* ---------- playback ---------- */
-func playSongs(songs []Song, nonInteractive bool) {
+func playSongs(songs []Song, playbackControlChan <-chan string) {
 	fmt.Println("\nControls: Press 's' to skip, 'q' to stop playback")
 	fmt.Println("Or use './dj skip' or './dj stop' from another terminal")
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGUSR1)
 
-	inputChan := make(chan string, 1)
-	quitInput := make(chan struct{})
-	if !nonInteractive {
-		go func() {
-			sc := bufio.NewScanner(os.Stdin)
+	commandChan := make(chan string, 1)
+	go func() {
+		for range sigChan {
+			if b, err := ioutil.ReadFile(commandFile); err == nil {
+				commandChan <- string(b)
+				_ = os.Remove(commandFile)
+			}
+		}
+	}()
+
+	overallStopped := false
+	for i, song := range songs {
+		if overallStopped {
+			break
+		}
+
+		fmt.Printf("\n[%d/%d] Now Playing:\n", i+1, len(songs))
+		fmt.Printf("  Title:       %s\n", song.Title)
+		fmt.Printf("  Artist:      %s\n", song.Artist)
+		fmt.Printf("  Album:       %s\n", song.Album)
+		if song.AlbumArtist != "" {
+			fmt.Printf("  Album Artist: %s\n", song.AlbumArtist)
+		}
+		if song.Year > 0 {
+			fmt.Printf("  Year:        %d\n", song.Year)
+		}
+		if song.Genre != "" {
+			fmt.Printf("  Genre:       %s\n", song.Genre)
+		}
+		if song.TrackNum > 0 {
+			if song.TrackTotal > 0 {
+				fmt.Printf("  Track:       %d/%d\n", song.TrackNum, song.TrackTotal)
+			} else {
+				fmt.Printf("  Track:       %d\n", song.TrackNum)
+			}
+		}
+		if song.DiscNum > 0 && song.DiscTotal > 0 {
+			fmt.Printf("  Disc:        %d/%d\n", song.DiscNum, song.DiscTotal)
+		}
+		if song.Composer != "" {
+			fmt.Printf("  Composer:    %s\n", song.Composer)
+		}
+		fmt.Printf("  Format:      %s\n", song.Format)
+		fmt.Printf("  File:        %s\n", song.ID)
+
+		var cmd *exec.Cmd
+		switch runtime.GOOS {
+		case "darwin":
+			cmd = exec.Command("afplay", song.ID)
+		case "linux":
+			if _, err := exec.LookPath("mpg123"); err == nil {
+				cmd = exec.Command("mpg123", "-q", song.ID)
+			} else if _, err := exec.LookPath("ffplay"); err == nil {
+				cmd = exec.Command("ffplay", "-nodisp", "-autoexit", song.ID)
+			}
+		case "windows":
+			cmd = exec.Command("cmd", "/C", "start", "/wait", song.ID)
+		}
+		if cmd == nil {
+			fmt.Println("No suitable media player found. Install mpg123 or ffplay.")
+			overallStopped = true
+			break
+		}
+		_ = cmd.Start()
+
+		songDone := make(chan error, 1)
+		go func() { songDone <- cmd.Wait() }()
+
+		songStopped := false
+		for { // Inner loop to continuously check for input/commands
+			select {
+			case in := <-playbackControlChan: // Listen to commands from queryMusic's stdin reader
+				switch in {
+				case "s", "skip":
+					fmt.Println("⏭️  Skipping to next song...")
+					_ = cmd.Process.Kill()
+					songStopped = true
+				case "q", "quit", "stop":
+					fmt.Println("⏹️  Stopping playback...")
+					_ = cmd.Process.Kill()
+					songStopped = true
+					overallStopped = true
+				}
+			case cmdIn := <-commandChan: // Listen to external commands
+				switch cmdIn {
+				case "skip":
+					fmt.Println("⏭️  Skipping to next song (external command)...")
+					_ = cmd.Process.Kill()
+					songStopped = true
+				case "stop":
+					fmt.Println("⏹️  Stopping playback (external command)...")
+					_ = cmd.Process.Kill()
+					songStopped = true
+					overallStopped = true
+				}
+			case <-songDone:
+				songStopped = true
+			case <-time.After(100 * time.Millisecond): // Prevent busy-waiting
+				// This allows the loop to re-evaluate overallStopped
+			}
+
+			if songStopped {
+				break
+			}
+		}
+	}
+	signal.Stop(sigChan)
+	fmt.Println("\n✓ Playback finished")
+}
+
+/* ---------- workers / helpers ---------- */
+func worker(id int, jobs <-chan string, results chan<- *Song, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for path := range jobs {
+		f, err := os.Open(path)
+		if err != nil {
+			results <- nil
+			continue
+		}
+		meta, err := tag.ReadFrom(f)
+		if err != nil {
+			f.Close()
+			results <- nil
+			continue
+		}
+		_, _ = f.Seek(0, 0)
+		hash, size, err := calculateHashAndSize(f)
+		f.Close()
+		if err != nil {
+			results <- nil
+			continue
+		}
+		track, trackTotal := meta.Track()
+		disc, discTotal := meta.Disc()
+		results <- &Song{
+			ID: path, Title: meta.Title(), Artist: meta.Artist(), Album: meta.Album(),
+			AlbumArtist: meta.AlbumArtist(), Composer: meta.Composer(), Genre: meta.Genre(),
+			Year: meta.Year(), TrackNum: track, TrackTotal: trackTotal,
+			DiscNum: disc, DiscTotal: discTotal, Lyrics: meta.Lyrics(), Comment: meta.Comment(),
+			Format: string(meta.Format()), FileSize: size, FileHash: hash, IndexedAt: time.Now().UTC(),
+		}
+	}
+}
+
+func isMusicFile(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".mp3", ".m4a", ".flac", ".ogg", ".wav", ".aac":
+		return true
+	}
+	return false
+}
+
+func calculateHashAndSize(r io.Reader) (string, int64, error) {
+	h := sha256.New()
+	n, err := io.Copy(h, r)
+	return hex.EncodeToString(h.Sum(nil)), n, err
+}
+
+/* ---------- mongo indexes ---------- */
+func createIndexes(coll *mongo.Collection) error {
+	models := []mongo.IndexModel{
+		{Keys: bson.D{{Key: "artist", Value: 1}}},
+		{Keys: bson.D{{Key: "title", Value: 1}}},
+		{Keys: bson.D{{Key: "year", Value: 1}}},
+		{Keys: bson.D{{Key: "genre", Value: 1}}},
+		{Keys: bson.D{{Key: "file_hash", Value: 1}}},
+	}
+	_, err := coll.Indexes().CreateMany(context.Background(), models)
+	return err
+}
+
+/* ---------- duplicates report ---------- */
+func findAndReportDuplicates(coll *mongo.Collection) error {
+	pipe := mongo.Pipeline{
+		bson.D{{Key: "$group", Value: bson.D{
+			{Key: "_id", Value: "$file_hash"},
+			{Key: "paths", Value: bson.D{{Key: "$push", Value: "$_id"}}},
+			{Key: "sizes", Value: bson.D{{Key: "$push", Value: "$file_size"}}},
+			{Key: "count", Value: bson.D{{Key: "$sum", Value: 1}}},
+		}}},
+		bson.D{{Key: "$match", Value: bson.D{{Key: "count", Value: bson.D{{Key: "$gt", Value: 1}}}}}},
+	}
+	cur, _ := coll.Aggregate(context.Background(), pipe)
+	defer cur.Close(context.Background())
+
+	out, _ := os.Create("duplicates.tsv")
+	defer out.Close()
+	_, _ = out.WriteString("file_hash\tfile_size\tfile_path\n")
+
+	found := false
+	for cur.Next(context.Background()) {
+		found = true
+		var res struct {
+			Hash  string   `bson:"_id"`
+			Paths []string `bson:"paths"`
+			Sizes []int64  `bson:"sizes"`
+		}
+		_ = cur.Decode(&res)
+		for i, p := range res.Paths {
+			_, _ = fmt.Fprintf(out, "%s\t%d\t%s\n", res.Hash, res.Sizes[i], p)
+		}
+	}
+	if !found {
+		_ = os.Remove("duplicates.tsv")
+		log.Println("No duplicate files found.")
+	} else {
+		log.Println("Duplicate file report saved to duplicates.tsv")
+	}
+	return cur.Err()
+}
 			for sc.Scan() {
 				inputChan <- strings.ToLower(strings.TrimSpace(sc.Text()))
 			}
