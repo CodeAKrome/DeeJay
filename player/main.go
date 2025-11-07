@@ -77,6 +77,7 @@ func printHelp() {
 	fmt.Println("  stop                      Stop playback and exit the player.")
 	fmt.Println("  help                      Show this help message.")
 	fmt.Println("\nOptions for 'query':")
+	fmt.Println("  --limit <number>          Limit the number of songs in the playlist.")
 	fmt.Println("  -r, -random               Randomize the playlist before playing.")
 	fmt.Println("\nExamples:")
 	fmt.Printf("  %s index /path/to/my/music\n", os.Args[0])
@@ -93,13 +94,28 @@ func main() {
 	}
 
 	randomize := false
+	limit := 0
 	rawArgs := os.Args[1:]
 	args := make([]string, 0, len(rawArgs))
-	for _, arg := range rawArgs {
+
+	// Manual flag parsing to handle flags before the command
+	i := 0
+	for i < len(rawArgs) {
+		arg := rawArgs[i]
 		if arg == "-r" || arg == "-random" {
 			randomize = true
+			i++
+		} else if arg == "--limit" {
+			if i+1 < len(rawArgs) {
+				if val, err := strconv.Atoi(rawArgs[i+1]); err == nil {
+					limit = val
+				}
+				i++
+			}
+			i++
 		} else {
-			args = append(args, arg)
+			args = append(args, rawArgs[i:]...)
+			break
 		}
 	}
 
@@ -129,7 +145,7 @@ func main() {
 		if len(args) > 1 {
 			cliQuery = strings.Join(args[1:], " ")
 		}
-		queryMusic(cliQuery, randomize)
+		queryMusic(cliQuery, randomize, limit)
 	case "skip":
 		sendCommand("skip")
 	case "stop":
@@ -212,7 +228,7 @@ func indexMusic(musicDir string) {
 }
 
 /* ---------- query / playback ---------- */
-func queryMusic(cliQuery string, randomize bool) {
+func queryMusic(cliQuery string, randomize bool, limit int) {
 	collection := connectToMongo()
 
 	if err := ioutil.WriteFile(pidFile, []byte(fmt.Sprintf("%d", os.Getpid())), 0644); err != nil {
@@ -264,17 +280,24 @@ func queryMusic(cliQuery string, randomize bool) {
 		if randomize {
 			rand.Shuffle(len(songs), func(i, j int) { songs[i], songs[j] = songs[j], songs[i] })
 		}
+		if limit > 0 && len(songs) > limit {
+			songs = songs[:limit]
+		}
 
-		if cliQuery == "" {
-			fmt.Printf("\nFound %d songs:\n", len(songs))
-			for i, s := range songs {
-				fmt.Printf("%d. %s - %s (%d) [%s]\n", i+1, s.Artist, s.Title, s.Year, s.Genre)
-			}
+		// Summarize playlist and decide whether to ask for confirmation
+		summarizePlaylist(songs)
+
+		// Skip confirmation if -r is used or if it's a direct CLI query
+		shouldPlay := randomize || cliQuery != ""
+
+		if !shouldPlay {
 			fmt.Printf("\nPlay all? (y/n): ")
 			if !scanner.Scan() {
 				break
 			}
-			if strings.ToLower(strings.TrimSpace(scanner.Text())) != "y" {
+			if strings.ToLower(strings.TrimSpace(scanner.Text())) == "y" {
+				shouldPlay = true
+			} else {
 				continue
 			}
 		}
@@ -285,6 +308,33 @@ func queryMusic(cliQuery string, randomize bool) {
 			break
 		}
 	}
+}
+
+func summarizePlaylist(songs []Song) {
+	if len(songs) == 0 {
+		return
+	}
+
+	artistCounts := make(map[string]int)
+	genreCounts := make(map[string]int)
+
+	for _, s := range songs {
+		artistCounts[s.Artist]++
+		if s.Genre != "" {
+			genreCounts[s.Genre]++
+		}
+	}
+
+	fmt.Printf("\nFound %d songs.\n", len(songs))
+	fmt.Println("--- Artists ---")
+	for artist, count := range artistCounts {
+		fmt.Printf("  %s: %d\n", artist, count)
+	}
+	fmt.Println("--- Genres ---")
+	for genre, count := range genreCounts {
+		fmt.Printf("  %s: %d\n", genre, count)
+	}
+	fmt.Println("---------------")
 }
 
 /* ---------- mongo ---------- */
@@ -403,7 +453,7 @@ func playSongs(songs []Song) {
 	}()
 
 	for i, song := range songs {
-		fmt.Printf("\n[%d/%d] Playing: %s - %s\n", i+1, len(songs), song.Artist, song.Title)
+		fmt.Printf("\n[%d/%d] Playing: %s - %s", i+1, len(songs), song.Artist, song.Title)
 
 		var cmd *exec.Cmd
 		switch runtime.GOOS {
