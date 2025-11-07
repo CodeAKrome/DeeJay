@@ -594,18 +594,6 @@ func playSongs(songs []Song, nonInteractive bool) {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGUSR1)
 
-	// inputChan := make(chan string, 1)
-	// quitInput := make(chan struct{})
-	// if !nonInteractive {
-	// 	go func() {
-	// 		sc := bufio.NewScanner(os.Stdin)
-	// 		for sc.Scan() {
-	// 			inputChan <- strings.ToLower(strings.TrimSpace(sc.Text()))
-	// 		}
-	// 		close(quitInput)
-	// 	}()
-	// }
-
 	inputChan := make(chan string, 1)
 	go func() {
 		if err := keyboard.Open(); err != nil {
