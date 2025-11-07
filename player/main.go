@@ -73,17 +73,23 @@ func printHelp() {
 	fmt.Println("Commands:")
 	fmt.Println("  index <music_directory>   Scan a directory and index music files into the database.")
 	fmt.Println("  query [\"query string\"]    Start interactive query mode or run a single query.")
+	fmt.Println("  list                      List all songs in the database with summary statistics.")
 	fmt.Println("  skip                      Skip the currently playing song.")
 	fmt.Println("  stop                      Stop playback and exit the player.")
 	fmt.Println("  help                      Show this help message.")
 	fmt.Println("\nOptions for 'query':")
 	fmt.Println("  --limit <number>          Limit the number of songs in the playlist.")
 	fmt.Println("  -r, -random               Randomize the playlist before playing.")
+	fmt.Println("\nOptions for 'list':")
+	fmt.Println("  --start-year <year>       Only list songs from this year onwards.")
+	fmt.Println("  --end-year <year>         Only list songs up to and including this year.")
 	fmt.Println("\nExamples:")
 	fmt.Printf("  %s index /path/to/my/music\n", os.Args[0])
 	fmt.Printf("  %s query\n", os.Args[0])
 	fmt.Printf("  %s query \"play rock from the 90s\"\n", os.Args[0])
 	fmt.Printf("  %s -r query \"play jazz by miles davis\"\n", os.Args[0])
+	fmt.Printf("  %s list\n", os.Args[0])
+	fmt.Printf("  %s list --start-year 1960 --end-year 1969\n", os.Args[0])
 	fmt.Printf("  %s skip\n", os.Args[0])
 }
 
@@ -95,6 +101,8 @@ func main() {
 
 	randomize := false
 	limit := 0
+	startYear := 0
+	endYear := 0
 	rawArgs := os.Args[1:]
 	args := make([]string, 0, len(rawArgs))
 
@@ -107,6 +115,20 @@ func main() {
 			if i+1 < len(rawArgs) {
 				if val, err := strconv.Atoi(rawArgs[i+1]); err == nil {
 					limit = val
+				}
+				i++
+			}
+		} else if arg == "--start-year" {
+			if i+1 < len(rawArgs) {
+				if val, err := strconv.Atoi(rawArgs[i+1]); err == nil {
+					startYear = val
+				}
+				i++
+			}
+		} else if arg == "--end-year" {
+			if i+1 < len(rawArgs) {
+				if val, err := strconv.Atoi(rawArgs[i+1]); err == nil {
+					endYear = val
 				}
 				i++
 			}
@@ -142,6 +164,8 @@ func main() {
 			cliQuery = strings.Join(args[1:], " ")
 		}
 		queryMusic(cliQuery, randomize, limit)
+	case "list":
+		listMusic(startYear, endYear)
 	case "skip":
 		sendCommand("skip")
 	case "stop":
@@ -223,6 +247,132 @@ func indexMusic(musicDir string) {
 	_ = findAndReportDuplicates(collection)
 }
 
+/* ---------- list ---------- */
+func listMusic(startYear, endYear int) {
+	collection := connectToMongo()
+
+	filter := bson.M{}
+	if startYear > 0 && endYear > 0 {
+		filter["year"] = bson.M{"$gte": startYear, "$lte": endYear}
+	} else if startYear > 0 {
+		filter["year"] = bson.M{"$gte": startYear}
+	} else if endYear > 0 {
+		filter["year"] = bson.M{"$lte": endYear}
+	}
+
+	cur, err := collection.Find(context.Background(), filter)
+	if err != nil {
+		log.Fatalf("Error listing songs: %v", err)
+	}
+	defer cur.Close(context.Background())
+
+	var songs []Song
+	if err := cur.All(context.Background(), &songs); err != nil {
+		log.Fatalf("Error decoding songs: %v", err)
+	}
+
+	if len(songs) == 0 {
+		fmt.Println("No songs found in database.")
+		return
+	}
+
+	// Print summary statistics
+	artistCounts := make(map[string]int)
+	genreCounts := make(map[string]int)
+	yearCounts := make(map[int]int)
+
+	for _, s := range songs {
+		if s.Artist != "" {
+			artistCounts[s.Artist]++
+		}
+		if s.Genre != "" {
+			genreCounts[s.Genre]++
+		}
+		if s.Year > 0 {
+			yearCounts[s.Year]++
+		}
+	}
+
+	fmt.Printf("\n=== Music Library Summary ===\n")
+	if startYear > 0 || endYear > 0 {
+		if startYear > 0 && endYear > 0 {
+			fmt.Printf("Years: %d - %d\n", startYear, endYear)
+		} else if startYear > 0 {
+			fmt.Printf("Years: %d and later\n", startYear)
+		} else {
+			fmt.Printf("Years: up to %d\n", endYear)
+		}
+	}
+	fmt.Printf("Total Songs: %d\n", len(songs))
+	fmt.Printf("Total Artists: %d\n", len(artistCounts))
+	fmt.Printf("Total Genres: %d\n\n", len(genreCounts))
+
+	fmt.Println("--- Top 20 Artists ---")
+	type kv struct {
+		Key   string
+		Value int
+	}
+	var artistList []kv
+	for k, v := range artistCounts {
+		artistList = append(artistList, kv{k, v})
+	}
+	// Sort by count descending
+	for i := 0; i < len(artistList); i++ {
+		for j := i + 1; j < len(artistList); j++ {
+			if artistList[j].Value > artistList[i].Value {
+				artistList[i], artistList[j] = artistList[j], artistList[i]
+			}
+		}
+	}
+	limit := 20
+	if len(artistList) < limit {
+		limit = len(artistList)
+	}
+	for i := 0; i < limit; i++ {
+		fmt.Printf("  %s: %d\n", artistList[i].Key, artistList[i].Value)
+	}
+
+	fmt.Println("\n--- Top 20 Genres ---")
+	var genreList []kv
+	for k, v := range genreCounts {
+		genreList = append(genreList, kv{k, v})
+	}
+	// Sort by count descending
+	for i := 0; i < len(genreList); i++ {
+		for j := i + 1; j < len(genreList); j++ {
+			if genreList[j].Value > genreList[i].Value {
+				genreList[i], genreList[j] = genreList[j], genreList[i]
+			}
+		}
+	}
+	limit = 20
+	if len(genreList) < limit {
+		limit = len(genreList)
+	}
+	for i := 0; i < limit; i++ {
+		fmt.Printf("  %s: %d\n", genreList[i].Key, genreList[i].Value)
+	}
+
+	fmt.Println("\n--- Songs by Year ---")
+	var yearList []kv
+	for k, v := range yearCounts {
+		yearList = append(yearList, kv{strconv.Itoa(k), v})
+	}
+	// Sort by year ascending
+	for i := 0; i < len(yearList); i++ {
+		for j := i + 1; j < len(yearList); j++ {
+			yi, _ := strconv.Atoi(yearList[i].Key)
+			yj, _ := strconv.Atoi(yearList[j].Key)
+			if yj < yi {
+				yearList[i], yearList[j] = yearList[j], yearList[i]
+			}
+		}
+	}
+	for _, item := range yearList {
+		fmt.Printf("  %s: %d\n", item.Key, item.Value)
+	}
+}
+
 /* ---------- query / playback ---------- */
 func queryMusic(cliQuery string, randomize bool, limit int) {
 	collection := connectToMongo()
@@ -272,6 +422,9 @@ func queryMusic(cliQuery string, randomize bool, limit int) {
 		}
 		if len(songs) == 0 {
 			fmt.Println("No songs found matching your criteria.")
+			if nonInteractive {
+				break
+			}
 			continue
 		}
 		if randomize {
@@ -313,11 +466,15 @@ func summarizePlaylist(songs []Song) {
 
 	artistCounts := make(map[string]int)
 	genreCounts := make(map[string]int)
+	yearCounts := make(map[int]int)
 
 	for _, s := range songs {
 		artistCounts[s.Artist]++
 		if s.Genre != "" {
 			genreCounts[s.Genre]++
+		}
+		if s.Year > 0 {
+			yearCounts[s.Year]++
 		}
 	}
 
@@ -329,6 +486,10 @@ func summarizePlaylist(songs []Song) {
 	fmt.Println("--- Genres ---")
 	for genre, count := range genreCounts {
 		fmt.Printf("  %s: %d\n", genre, count)
+	}
+	fmt.Println("--- Years ---")
+	for year, count := range yearCounts {
+		fmt.Printf("  %d: %d\n", year, count)
 	}
 	fmt.Println("---------------")
 }
@@ -379,7 +540,7 @@ func parseQuery(q string) QueryCriteria {
 		c.YearEnd, _ = strconv.Atoi(m[2])
 	}
 	if c.YearStart == 0 {
-		if m := regexp.MustCompile(`(?:in|from)\s+(\d{4})`).FindStringSubmatch(q); len(m) > 1 {
+		if m := regexp.MustCompile(`(?:in|from|year)\s+(\d{4})`).FindStringSubmatch(q); len(m) > 1 {
 			yr, _ := strconv.Atoi(m[1])
 			c.YearStart, c.YearEnd = yr, yr
 		}
@@ -455,7 +616,34 @@ func playSongs(songs []Song, nonInteractive bool) {
 	}()
 
 	for i, song := range songs {
-		fmt.Printf("\n[%d/%d] Playing: %s - %s", i+1, len(songs), song.Artist, song.Title)
+		fmt.Printf("\n[%d/%d] Now Playing:\n", i+1, len(songs))
+		fmt.Printf("  Title:       %s\n", song.Title)
+		fmt.Printf("  Artist:      %s\n", song.Artist)
+		fmt.Printf("  Album:       %s\n", song.Album)
+		if song.AlbumArtist != "" {
+			fmt.Printf("  Album Artist: %s\n", song.AlbumArtist)
+		}
+		if song.Year > 0 {
+			fmt.Printf("  Year:        %d\n", song.Year)
+		}
+		if song.Genre != "" {
+			fmt.Printf("  Genre:       %s\n", song.Genre)
+		}
+		if song.TrackNum > 0 {
+			if song.TrackTotal > 0 {
+				fmt.Printf("  Track:       %d/%d\n", song.TrackNum, song.TrackTotal)
+			} else {
+				fmt.Printf("  Track:       %d\n", song.TrackNum)
+			}
+		}
+		if song.DiscNum > 0 && song.DiscTotal > 0 {
+			fmt.Printf("  Disc:        %d/%d\n", song.DiscNum, song.DiscTotal)
+		}
+		if song.Composer != "" {
+			fmt.Printf("  Composer:    %s\n", song.Composer)
+		}
+		fmt.Printf("  Format:      %s\n", song.Format)
+		fmt.Printf("  File:        %s\n", song.ID)
 
 		var cmd *exec.Cmd
 		switch runtime.GOOS {
