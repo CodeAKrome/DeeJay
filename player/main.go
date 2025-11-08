@@ -82,6 +82,7 @@ type TUIState struct {
 	currentSong  *Song
 	songIndex    int
 	totalSongs   int
+	playlist     []Song // Full playlist for showing upcoming songs
 	message      string
 	showHelp     bool
 }
@@ -250,19 +251,28 @@ func queryMusicTUI(cliQuery string, randomize bool, limit int) {
 	var currentCmd *exec.Cmd
 	var songs []Song
 	var songIndex int
+	var playbackActive bool
+	playbackMutex := &sync.Mutex{}
+
+	// Cleanup function to kill any running music process
+	defer func() {
+		if currentCmd != nil {
+			currentCmd.Process.Kill()
+		}
+	}()
 
 	for {
 		select {
 		case ev := <-eventChan:
 			if ev.Type == termbox.EventKey {
-				if handleKeyEvent(&ev, state, collection, randomize, limit, &currentCmd, &songs, &songIndex) {
+				if handleKeyEvent(&ev, state, collection, randomize, limit, &currentCmd, &songs, &songIndex, &playbackActive, playbackMutex) {
 					return
 				}
 			} else if ev.Type == termbox.EventResize {
 				// Just redraw on resize
 			}
 		case cmd := <-commandChan:
-			handleExternalCommand(cmd, &currentCmd, &songs, &songIndex, state)
+			handleExternalCommand(cmd, &currentCmd, &songs, &songIndex, state, playbackMutex)
 		case <-ticker.C:
 			// Periodic redraw
 		}
@@ -270,37 +280,66 @@ func queryMusicTUI(cliQuery string, randomize bool, limit int) {
 	}
 }
 
-func handleKeyEvent(ev *termbox.Event, state *TUIState, collection *mongo.Collection, randomize bool, limit int, currentCmd **exec.Cmd, songs *[]Song, songIndex *int) bool {
+func handleKeyEvent(ev *termbox.Event, state *TUIState, collection *mongo.Collection, randomize bool, limit int, currentCmd **exec.Cmd, songs *[]Song, songIndex *int, playbackActive *bool, mu *sync.Mutex) bool {
 	if state.showHelp {
 		state.showHelp = false
 		return false
 	}
 
+	// Handle query window mode separately
+	if state.activeWindow == "query" {
+		switch ev.Key {
+		case termbox.KeyEsc, termbox.KeyCtrlC:
+			state.activeWindow = "artist" // Exit query mode
+			return false
+		case termbox.KeyEnter:
+			runQuery(collection, state, randomize, limit)
+			state.activeWindow = "artist" // Exit query mode after running query
+			// Start playback
+			mu.Lock()
+			if !*playbackActive {
+				*playbackActive = true
+				go playback(state, currentCmd, songs, songIndex, playbackActive, mu)
+			}
+			mu.Unlock()
+		case termbox.KeySpace:
+			// Space types a space in query mode
+			state.query = state.query[:state.cursorPos] + " " + state.query[state.cursorPos:]
+			state.cursorPos++
+		case termbox.KeyBackspace, termbox.KeyBackspace2:
+			if state.cursorPos > 0 {
+				state.query = state.query[:state.cursorPos-1] + state.query[state.cursorPos:]
+				state.cursorPos--
+			}
+		case termbox.KeyArrowLeft:
+			if state.cursorPos > 0 {
+				state.cursorPos--
+			}
+		case termbox.KeyArrowRight:
+			if state.cursorPos < len(state.query) {
+				state.cursorPos++
+			}
+		case termbox.KeyTab:
+			state.activeWindow = "artist" // Allow tab to exit query mode
+		default:
+			if ev.Ch != 0 {
+				state.query = state.query[:state.cursorPos] + string(ev.Ch) + state.query[state.cursorPos:]
+				state.cursorPos++
+			}
+		}
+		return false
+	}
+
+	// Handle all other windows
 	switch ev.Key {
 	case termbox.KeyEsc, termbox.KeyCtrlC:
+		if *currentCmd != nil {
+			(*currentCmd).Process.Kill()
+		}
 		return true
 	case termbox.KeySpace:
 		state.activeWindow = "query"
 		state.cursorPos = len(state.query)
-	case termbox.KeyEnter:
-		if state.activeWindow == "query" {
-			runQuery(collection, state, randomize, limit)
-			// Start playback
-			go playback(state, currentCmd, songs, songIndex)
-		}
-	case termbox.KeyBackspace, termbox.KeyBackspace2:
-		if state.activeWindow == "query" && state.cursorPos > 0 {
-			state.query = state.query[:state.cursorPos-1] + state.query[state.cursorPos:]
-			state.cursorPos--
-		}
-	case termbox.KeyArrowLeft:
-		if state.activeWindow == "query" && state.cursorPos > 0 {
-			state.cursorPos--
-		}
-	case termbox.KeyArrowRight:
-		if state.activeWindow == "query" && state.cursorPos < len(state.query) {
-			state.cursorPos++
-		}
 	case termbox.KeyArrowUp:
 		scrollWindow(state, -1)
 	case termbox.KeyArrowDown:
@@ -309,13 +348,12 @@ func handleKeyEvent(ev *termbox.Event, state *TUIState, collection *mongo.Collec
 		if ev.Ch != 0 {
 			switch ev.Ch {
 			case 'q':
-				if state.activeWindow != "query" {
-					return true
+				if *currentCmd != nil {
+					(*currentCmd).Process.Kill()
 				}
+				return true
 			case 's':
-				if state.activeWindow != "query" {
-					skipSong(currentCmd, songs, songIndex, state)
-				}
+				skipSong(currentCmd, songs, songIndex, state, mu)
 			case 'a':
 				state.activeWindow = "artist"
 			case 'g':
@@ -324,11 +362,6 @@ func handleKeyEvent(ev *termbox.Event, state *TUIState, collection *mongo.Collec
 				state.activeWindow = "year"
 			case 'h', '?':
 				state.showHelp = true
-			default:
-				if state.activeWindow == "query" {
-					state.query = state.query[:state.cursorPos] + string(ev.Ch) + state.query[state.cursorPos:]
-					state.cursorPos++
-				}
 			}
 		}
 	}
@@ -404,6 +437,7 @@ func runQuery(collection *mongo.Collection, state *TUIState, randomize bool, lim
 	state.genres = mapToSortedSlice(genreCounts, true)
 	state.years = yearMapToSortedSlice(yearCounts)
 	state.totalSongs = len(songs)
+	state.playlist = songs // Store full playlist
 	state.message = fmt.Sprintf("Found %d songs", len(songs))
 }
 
@@ -457,21 +491,35 @@ func drawUI(state *TUIState) {
 		termbox.SetCell(x, 1, '─', termbox.ColorWhite, termbox.ColorDefault)
 	}
 
-	// Calculate middle section height (leave space for bottom section)
-	bottomHeight := 12                       // Approximate lines needed for song info
-	middleHeight := h - 2 - bottomHeight - 1 // -2 for top, -1 for separator
+	// Calculate section heights
+	songInfoHeight := 6 // Compact song info at bottom
+	// Queue section gets remaining space after middle and song info
+	middleHeight := (h - 2 - songInfoHeight - 4) / 2 // -2 for top, -4 for separators
 	if middleHeight < 5 {
 		middleHeight = 5
 	}
+	queueHeight := h - 2 - middleHeight - songInfoHeight - 3 // What's left for queue
+	if queueHeight < 3 {
+		queueHeight = 3
+	}
 
 	middleY := 2
-	bottomY := middleY + middleHeight + 1
+	queueY := middleY + middleHeight + 1
+	bottomY := queueY + queueHeight + 1
 
 	// Middle: Three columns
 	colWidth := w / 3
 	drawColumn(0, middleY, colWidth, middleHeight, "Artists (a)", state.artists, state.artistScroll, state.activeWindow == "artist")
 	drawColumn(colWidth, middleY, colWidth, middleHeight, "Genres (g)", state.genres, state.genreScroll, state.activeWindow == "genre")
 	drawColumn(colWidth*2, middleY, w-colWidth*2, middleHeight, "Years (y)", state.years, state.yearScroll, state.activeWindow == "year")
+
+	// Draw separator before queue section
+	for x := 0; x < w; x++ {
+		termbox.SetCell(x, queueY-1, '─', termbox.ColorWhite, termbox.ColorDefault)
+	}
+
+	// Queue: Upcoming songs
+	drawQueue(0, queueY, w, queueHeight, state)
 
 	// Draw separator before bottom
 	for x := 0; x < w; x++ {
@@ -483,7 +531,7 @@ func drawUI(state *TUIState) {
 
 	// Status line at very bottom
 	statusY := h - 1
-	status := fmt.Sprintf(" [Space]=Query [a/g/y]=Windows [↑↓]=Scroll [s]=Skip [q]=Quit [?]=Help | %s", state.message)
+	status := fmt.Sprintf(" [Space]=Query [Enter]=Run [Esc]=Exit Query [a/g/y]=Windows [↑↓]=Scroll [s]=Skip [q]=Quit [?]=Help | %s", state.message)
 	drawText(0, statusY, status, termbox.ColorBlack, termbox.ColorWhite)
 
 	termbox.Flush()
@@ -495,6 +543,7 @@ func drawHelp(w, h int) {
 		"",
 		"  Space   - Jump to query window",
 		"  Enter   - Execute query and play",
+		"  Esc     - Exit query window",
 		"  q       - Quit (when not in query window)",
 		"  s       - Skip current song",
 		"  a       - Switch to Artists window",
@@ -550,43 +599,69 @@ func drawColumn(x, y, w, h int, title string, items []CountItem, scroll int, act
 	}
 }
 
+func drawQueue(x, y, w, h int, state *TUIState) {
+	title := "Up Next"
+	drawText(x, y, title, termbox.ColorCyan|termbox.AttrBold, termbox.ColorDefault)
+
+	if len(state.playlist) == 0 || state.songIndex >= len(state.playlist)-1 {
+		drawText(x+2, y+1, "No upcoming songs", termbox.ColorWhite|termbox.AttrDim, termbox.ColorDefault)
+		return
+	}
+
+	// Show upcoming songs starting from next song
+	visibleHeight := h - 1
+	nextIdx := state.songIndex + 1
+
+	for i := 0; i < visibleHeight && nextIdx+i < len(state.playlist); i++ {
+		song := state.playlist[nextIdx+i]
+		line := fmt.Sprintf("  %d. %s - %s", nextIdx+i+1, song.Artist, song.Title)
+		if song.Album != "" {
+			line += fmt.Sprintf(" (%s)", song.Album)
+		}
+		if len(line) > w-1 {
+			line = line[:w-4] + "..."
+		}
+		drawText(x, y+1+i, line, termbox.ColorWhite, termbox.ColorDefault)
+	}
+
+	// Show indicator if more songs exist
+	if nextIdx+visibleHeight < len(state.playlist) {
+		remaining := len(state.playlist) - (nextIdx + visibleHeight)
+		indicator := fmt.Sprintf("  ... and %d more", remaining)
+		drawText(x, y+h-1, indicator, termbox.ColorCyan|termbox.AttrDim, termbox.ColorDefault)
+	}
+}
+
 func drawSongInfo(x, y, w int, state *TUIState) {
 	if state.currentSong == nil {
-		drawText(x, y, "No song playing", termbox.ColorWhite, termbox.ColorDefault)
+		drawText(x, y, "No song playing", termbox.ColorWhite|termbox.AttrDim, termbox.ColorDefault)
 		return
 	}
 
 	s := state.currentSong
-	lines := []string{
-		fmt.Sprintf("[%d/%d] Now Playing:", state.songIndex+1, state.totalSongs),
-		fmt.Sprintf("Title: %s", s.Title),
-		fmt.Sprintf("Artist: %s  |  Album: %s", s.Artist, s.Album),
-	}
 
-	extra := ""
+	// Compact format to save space
+	line1 := fmt.Sprintf("♪ [%d/%d] %s", state.songIndex+1, state.totalSongs, s.Title)
+	line2 := fmt.Sprintf("  %s", s.Artist)
+	if s.Album != "" {
+		line2 += fmt.Sprintf(" • %s", s.Album)
+	}
 	if s.Year > 0 {
-		extra += fmt.Sprintf("Year: %d  ", s.Year)
+		line2 += fmt.Sprintf(" • %d", s.Year)
 	}
 	if s.Genre != "" {
-		extra += fmt.Sprintf("Genre: %s  ", s.Genre)
-	}
-	if s.TrackNum > 0 {
-		if s.TrackTotal > 0 {
-			extra += fmt.Sprintf("Track: %d/%d", s.TrackNum, s.TrackTotal)
-		} else {
-			extra += fmt.Sprintf("Track: %d", s.TrackNum)
-		}
-	}
-	if extra != "" {
-		lines = append(lines, extra)
+		line2 += fmt.Sprintf(" • %s", s.Genre)
 	}
 
-	for i, line := range lines {
-		if len(line) > w-1 {
-			line = line[:w-4] + "..."
-		}
-		drawText(x, y+i, line, termbox.ColorWhite, termbox.ColorDefault)
+	if len(line1) > w-1 {
+		line1 = line1[:w-4] + "..."
 	}
+	if len(line2) > w-1 {
+		line2 = line2[:w-4] + "..."
+	}
+
+	drawText(x, y, line1, termbox.ColorGreen|termbox.AttrBold, termbox.ColorDefault)
+	drawText(x, y+1, line2, termbox.ColorWhite, termbox.ColorDefault)
 }
 
 func drawText(x, y int, text string, fg, bg termbox.Attribute) {
@@ -595,20 +670,28 @@ func drawText(x, y int, text string, fg, bg termbox.Attribute) {
 	}
 }
 
-func playback(state *TUIState, currentCmd **exec.Cmd, songs *[]Song, songIndex *int) {
-	collection := connectToMongo()
-	criteria := parseQuery(state.query)
-	foundSongs, err := searchSongs(collection, criteria)
-	if err != nil {
-		return
-	}
-	*songs = foundSongs
-	*songIndex = 0
+func playback(state *TUIState, currentCmd **exec.Cmd, songs *[]Song, songIndex *int, playbackActive *bool, mu *sync.Mutex) {
+	defer func() {
+		mu.Lock()
+		*playbackActive = false
+		mu.Unlock()
+	}()
 
-	for *songIndex < len(*songs) {
+	mu.Lock()
+	*songs = state.playlist
+	*songIndex = 0
+	mu.Unlock()
+
+	for {
+		mu.Lock()
+		if *songIndex >= len(*songs) {
+			mu.Unlock()
+			break
+		}
 		song := (*songs)[*songIndex]
 		state.currentSong = &song
 		state.songIndex = *songIndex
+		mu.Unlock()
 
 		var cmd *exec.Cmd
 		switch runtime.GOOS {
@@ -618,7 +701,7 @@ func playback(state *TUIState, currentCmd **exec.Cmd, songs *[]Song, songIndex *
 			if _, err := exec.LookPath("mpg123"); err == nil {
 				cmd = exec.Command("mpg123", "-q", song.ID)
 			} else if _, err := exec.LookPath("ffplay"); err == nil {
-				cmd = exec.Command("ffplay", "-nodisp", "-autoexit", song.ID)
+				cmd = exec.Command("ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", song.ID)
 			}
 		case "windows":
 			cmd = exec.Command("cmd", "/C", "start", "/wait", song.ID)
@@ -628,33 +711,44 @@ func playback(state *TUIState, currentCmd **exec.Cmd, songs *[]Song, songIndex *
 			return
 		}
 
+		mu.Lock()
 		*currentCmd = cmd
+		mu.Unlock()
+
 		_ = cmd.Start()
 		_ = cmd.Wait()
-		*currentCmd = nil
 
+		mu.Lock()
+		*currentCmd = nil
 		*songIndex++
+		mu.Unlock()
 	}
 
 	state.currentSong = nil
 	state.message = "Playback finished"
 }
 
-func skipSong(currentCmd **exec.Cmd, songs *[]Song, songIndex *int, state *TUIState) {
+func skipSong(currentCmd **exec.Cmd, songs *[]Song, songIndex *int, state *TUIState, mu *sync.Mutex) {
+	mu.Lock()
+	defer mu.Unlock()
+
 	if *currentCmd != nil {
+		// Just kill the current song - playback loop will advance naturally
 		(*currentCmd).Process.Kill()
 		state.message = "Skipped"
 	}
 }
 
-func handleExternalCommand(cmd string, currentCmd **exec.Cmd, songs *[]Song, songIndex *int, state *TUIState) {
+func handleExternalCommand(cmd string, currentCmd **exec.Cmd, songs *[]Song, songIndex *int, state *TUIState, mu *sync.Mutex) {
 	switch cmd {
 	case "skip":
-		skipSong(currentCmd, songs, songIndex, state)
+		skipSong(currentCmd, songs, songIndex, state, mu)
 	case "stop":
 		if *currentCmd != nil {
 			(*currentCmd).Process.Kill()
+			*currentCmd = nil
 		}
+		state.currentSong = nil
 		state.message = "Stopped by external command"
 	}
 }
