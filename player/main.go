@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -16,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,7 +23,7 @@ import (
 	"time"
 
 	"github.com/dhowden/tag"
-	"github.com/eiannone/keyboard"
+	"github.com/nsf/termbox-go"
 	"github.com/schollz/progressbar/v3"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -69,11 +69,33 @@ type QueryCriteria struct {
 	Decade    int
 }
 
+type TUIState struct {
+	query        string
+	cursorPos    int
+	activeWindow string // "query", "artist", "genre", "year"
+	artistScroll int
+	genreScroll  int
+	yearScroll   int
+	artists      []CountItem
+	genres       []CountItem
+	years        []CountItem
+	currentSong  *Song
+	songIndex    int
+	totalSongs   int
+	message      string
+	showHelp     bool
+}
+
+type CountItem struct {
+	Key   string
+	Value int
+}
+
 func printHelp() {
 	fmt.Printf("Usage: %s <command> [options]\n\n", os.Args[0])
 	fmt.Println("Commands:")
 	fmt.Println("  index <music_directory>   Scan a directory and index music files into the database.")
-	fmt.Println("  query [\"query string\"]    Start interactive query mode or run a single query.")
+	fmt.Println("  query [\"query string\"]    Start interactive query mode with TUI.")
 	fmt.Println("  list                      List all songs in the database with summary statistics.")
 	fmt.Println("  skip                      Skip the currently playing song.")
 	fmt.Println("  stop                      Stop playback and exit the player.")
@@ -90,7 +112,6 @@ func printHelp() {
 	fmt.Printf("  %s query \"play rock from the 90s\"\n", os.Args[0])
 	fmt.Printf("  %s -r query \"play jazz by miles davis\"\n", os.Args[0])
 	fmt.Printf("  %s list\n", os.Args[0])
-	fmt.Printf("  %s list --start-year 1960 --end-year 1969\n", os.Args[0])
 	fmt.Printf("  %s skip\n", os.Args[0])
 }
 
@@ -107,7 +128,6 @@ func main() {
 	rawArgs := os.Args[1:]
 	args := make([]string, 0, len(rawArgs))
 
-	// Manual flag parsing to handle flags anywhere in arguments
 	for i := 0; i < len(rawArgs); i++ {
 		arg := rawArgs[i]
 		if arg == "-r" || arg == "--random" {
@@ -138,7 +158,6 @@ func main() {
 		}
 	}
 
-	// Seed the random number generator if we're randomizing.
 	if randomize {
 		rand.Seed(time.Now().UnixNano())
 	}
@@ -164,7 +183,7 @@ func main() {
 		if len(args) > 1 {
 			cliQuery = strings.Join(args[1:], " ")
 		}
-		queryMusic(cliQuery, randomize, limit)
+		queryMusicTUI(cliQuery, randomize, limit)
 	case "list":
 		listMusic(startYear, endYear)
 	case "skip":
@@ -173,6 +192,470 @@ func main() {
 		sendCommand("stop")
 	default:
 		log.Fatalf("Unknown mode: %s", args[0])
+	}
+}
+
+/* ---------- TUI ---------- */
+func queryMusicTUI(cliQuery string, randomize bool, limit int) {
+	collection := connectToMongo()
+
+	if err := ioutil.WriteFile(pidFile, []byte(fmt.Sprintf("%d", os.Getpid())), 0644); err != nil {
+		log.Printf("Warning: Could not write PID file: %v", err)
+	}
+	defer os.Remove(pidFile)
+	defer os.Remove(commandFile)
+
+	err := termbox.Init()
+	if err != nil {
+		panic(err)
+	}
+	defer termbox.Close()
+
+	state := &TUIState{
+		query:        cliQuery,
+		activeWindow: "query",
+		artists:      []CountItem{},
+		genres:       []CountItem{},
+		years:        []CountItem{},
+	}
+
+	// If we have an initial query, run it
+	if cliQuery != "" {
+		runQuery(collection, state, randomize, limit)
+	}
+
+	eventChan := make(chan termbox.Event)
+	go func() {
+		for {
+			eventChan <- termbox.PollEvent()
+		}
+	}()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGUSR1)
+
+	commandChan := make(chan string, 1)
+	go func() {
+		for range sigChan {
+			if b, err := ioutil.ReadFile(commandFile); err == nil {
+				commandChan <- string(b)
+				_ = os.Remove(commandFile)
+			}
+		}
+	}()
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	var currentCmd *exec.Cmd
+	var songs []Song
+	var songIndex int
+
+	for {
+		select {
+		case ev := <-eventChan:
+			if ev.Type == termbox.EventKey {
+				if handleKeyEvent(&ev, state, collection, randomize, limit, &currentCmd, &songs, &songIndex) {
+					return
+				}
+			} else if ev.Type == termbox.EventResize {
+				// Just redraw on resize
+			}
+		case cmd := <-commandChan:
+			handleExternalCommand(cmd, &currentCmd, &songs, &songIndex, state)
+		case <-ticker.C:
+			// Periodic redraw
+		}
+		drawUI(state)
+	}
+}
+
+func handleKeyEvent(ev *termbox.Event, state *TUIState, collection *mongo.Collection, randomize bool, limit int, currentCmd **exec.Cmd, songs *[]Song, songIndex *int) bool {
+	if state.showHelp {
+		state.showHelp = false
+		return false
+	}
+
+	switch ev.Key {
+	case termbox.KeyEsc, termbox.KeyCtrlC:
+		return true
+	case termbox.KeySpace:
+		state.activeWindow = "query"
+		state.cursorPos = len(state.query)
+	case termbox.KeyEnter:
+		if state.activeWindow == "query" {
+			runQuery(collection, state, randomize, limit)
+			// Start playback
+			go playback(state, currentCmd, songs, songIndex)
+		}
+	case termbox.KeyBackspace, termbox.KeyBackspace2:
+		if state.activeWindow == "query" && state.cursorPos > 0 {
+			state.query = state.query[:state.cursorPos-1] + state.query[state.cursorPos:]
+			state.cursorPos--
+		}
+	case termbox.KeyArrowLeft:
+		if state.activeWindow == "query" && state.cursorPos > 0 {
+			state.cursorPos--
+		}
+	case termbox.KeyArrowRight:
+		if state.activeWindow == "query" && state.cursorPos < len(state.query) {
+			state.cursorPos++
+		}
+	case termbox.KeyArrowUp:
+		scrollWindow(state, -1)
+	case termbox.KeyArrowDown:
+		scrollWindow(state, 1)
+	default:
+		if ev.Ch != 0 {
+			switch ev.Ch {
+			case 'q':
+				if state.activeWindow != "query" {
+					return true
+				}
+			case 's':
+				if state.activeWindow != "query" {
+					skipSong(currentCmd, songs, songIndex, state)
+				}
+			case 'a':
+				state.activeWindow = "artist"
+			case 'g':
+				state.activeWindow = "genre"
+			case 'y':
+				state.activeWindow = "year"
+			case 'h', '?':
+				state.showHelp = true
+			default:
+				if state.activeWindow == "query" {
+					state.query = state.query[:state.cursorPos] + string(ev.Ch) + state.query[state.cursorPos:]
+					state.cursorPos++
+				}
+			}
+		}
+	}
+	return false
+}
+
+func scrollWindow(state *TUIState, delta int) {
+	switch state.activeWindow {
+	case "artist":
+		state.artistScroll += delta
+		if state.artistScroll < 0 {
+			state.artistScroll = 0
+		}
+		if state.artistScroll >= len(state.artists) {
+			state.artistScroll = len(state.artists) - 1
+		}
+	case "genre":
+		state.genreScroll += delta
+		if state.genreScroll < 0 {
+			state.genreScroll = 0
+		}
+		if state.genreScroll >= len(state.genres) {
+			state.genreScroll = len(state.genres) - 1
+		}
+	case "year":
+		state.yearScroll += delta
+		if state.yearScroll < 0 {
+			state.yearScroll = 0
+		}
+		if state.yearScroll >= len(state.years) {
+			state.yearScroll = len(state.years) - 1
+		}
+	}
+}
+
+func runQuery(collection *mongo.Collection, state *TUIState, randomize bool, limit int) {
+	criteria := parseQuery(state.query)
+	songs, err := searchSongs(collection, criteria)
+	if err != nil {
+		state.message = fmt.Sprintf("Error: %v", err)
+		return
+	}
+	if len(songs) == 0 {
+		state.message = "No songs found"
+		return
+	}
+
+	if randomize {
+		rand.Shuffle(len(songs), func(i, j int) { songs[i], songs[j] = songs[j], songs[i] })
+	}
+	if limit > 0 && len(songs) > limit {
+		songs = songs[:limit]
+	}
+
+	// Update statistics
+	artistCounts := make(map[string]int)
+	genreCounts := make(map[string]int)
+	yearCounts := make(map[int]int)
+
+	for _, s := range songs {
+		if s.Artist != "" {
+			artistCounts[s.Artist]++
+		}
+		if s.Genre != "" {
+			genreCounts[s.Genre]++
+		}
+		if s.Year > 0 {
+			yearCounts[s.Year]++
+		}
+	}
+
+	state.artists = mapToSortedSlice(artistCounts, true)
+	state.genres = mapToSortedSlice(genreCounts, true)
+	state.years = yearMapToSortedSlice(yearCounts)
+	state.totalSongs = len(songs)
+	state.message = fmt.Sprintf("Found %d songs", len(songs))
+}
+
+func mapToSortedSlice(m map[string]int, descending bool) []CountItem {
+	var items []CountItem
+	for k, v := range m {
+		items = append(items, CountItem{k, v})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if descending {
+			return items[i].Value > items[j].Value
+		}
+		return items[i].Value < items[j].Value
+	})
+	return items
+}
+
+func yearMapToSortedSlice(m map[int]int) []CountItem {
+	var items []CountItem
+	for k, v := range m {
+		items = append(items, CountItem{strconv.Itoa(k), v})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].Key < items[j].Key
+	})
+	return items
+}
+
+func drawUI(state *TUIState) {
+	termbox.Clear(termbox.ColorDefault, termbox.ColorDefault)
+	w, h := termbox.Size()
+
+	if state.showHelp {
+		drawHelp(w, h)
+		termbox.Flush()
+		return
+	}
+
+	// Top: Query line
+	drawText(0, 0, "Query: ", termbox.ColorYellow|termbox.AttrBold, termbox.ColorDefault)
+	queryX := 7
+	drawText(queryX, 0, state.query, termbox.ColorWhite, termbox.ColorDefault)
+	if state.activeWindow == "query" {
+		termbox.SetCursor(queryX+state.cursorPos, 0)
+	} else {
+		termbox.HideCursor()
+	}
+
+	// Draw separator
+	for x := 0; x < w; x++ {
+		termbox.SetCell(x, 1, '─', termbox.ColorWhite, termbox.ColorDefault)
+	}
+
+	// Calculate middle section height (leave space for bottom section)
+	bottomHeight := 12                       // Approximate lines needed for song info
+	middleHeight := h - 2 - bottomHeight - 1 // -2 for top, -1 for separator
+	if middleHeight < 5 {
+		middleHeight = 5
+	}
+
+	middleY := 2
+	bottomY := middleY + middleHeight + 1
+
+	// Middle: Three columns
+	colWidth := w / 3
+	drawColumn(0, middleY, colWidth, middleHeight, "Artists (a)", state.artists, state.artistScroll, state.activeWindow == "artist")
+	drawColumn(colWidth, middleY, colWidth, middleHeight, "Genres (g)", state.genres, state.genreScroll, state.activeWindow == "genre")
+	drawColumn(colWidth*2, middleY, w-colWidth*2, middleHeight, "Years (y)", state.years, state.yearScroll, state.activeWindow == "year")
+
+	// Draw separator before bottom
+	for x := 0; x < w; x++ {
+		termbox.SetCell(x, bottomY-1, '─', termbox.ColorWhite, termbox.ColorDefault)
+	}
+
+	// Bottom: Current song info
+	drawSongInfo(0, bottomY, w, state)
+
+	// Status line at very bottom
+	statusY := h - 1
+	status := fmt.Sprintf(" [Space]=Query [a/g/y]=Windows [↑↓]=Scroll [s]=Skip [q]=Quit [?]=Help | %s", state.message)
+	drawText(0, statusY, status, termbox.ColorBlack, termbox.ColorWhite)
+
+	termbox.Flush()
+}
+
+func drawHelp(w, h int) {
+	help := []string{
+		"DeeJay TUI - Keyboard Commands",
+		"",
+		"  Space   - Jump to query window",
+		"  Enter   - Execute query and play",
+		"  q       - Quit (when not in query window)",
+		"  s       - Skip current song",
+		"  a       - Switch to Artists window",
+		"  g       - Switch to Genres window",
+		"  y       - Switch to Years window",
+		"  ↑/↓     - Scroll in active window",
+		"  h or ?  - Show this help",
+		"  Esc     - Close help / Quit",
+		"",
+		"Press any key to close help...",
+	}
+
+	startY := (h - len(help)) / 2
+	for i, line := range help {
+		x := (w - len(line)) / 2
+		if x < 0 {
+			x = 0
+		}
+		drawText(x, startY+i, line, termbox.ColorWhite, termbox.ColorDefault)
+	}
+}
+
+func drawColumn(x, y, w, h int, title string, items []CountItem, scroll int, active bool) {
+	fg := termbox.ColorWhite
+	if active {
+		fg = termbox.ColorYellow | termbox.AttrBold
+	}
+	drawText(x, y, title, fg, termbox.ColorDefault)
+
+	// Draw vertical separator
+	if x > 0 {
+		for dy := 0; dy < h; dy++ {
+			termbox.SetCell(x-1, y+dy, '│', termbox.ColorWhite, termbox.ColorDefault)
+		}
+	}
+
+	visibleHeight := h - 1
+	for i := 0; i < visibleHeight && scroll+i < len(items); i++ {
+		item := items[scroll+i]
+		line := fmt.Sprintf("  %s: %d", item.Key, item.Value)
+		if len(line) > w-1 {
+			line = line[:w-4] + "..."
+		}
+		drawText(x, y+1+i, line, termbox.ColorWhite, termbox.ColorDefault)
+	}
+
+	// Show scroll indicators
+	if scroll > 0 {
+		drawText(x+w-3, y, "▲", termbox.ColorCyan, termbox.ColorDefault)
+	}
+	if scroll+visibleHeight < len(items) {
+		drawText(x+w-3, y+h-1, "▼", termbox.ColorCyan, termbox.ColorDefault)
+	}
+}
+
+func drawSongInfo(x, y, w int, state *TUIState) {
+	if state.currentSong == nil {
+		drawText(x, y, "No song playing", termbox.ColorWhite, termbox.ColorDefault)
+		return
+	}
+
+	s := state.currentSong
+	lines := []string{
+		fmt.Sprintf("[%d/%d] Now Playing:", state.songIndex+1, state.totalSongs),
+		fmt.Sprintf("Title: %s", s.Title),
+		fmt.Sprintf("Artist: %s  |  Album: %s", s.Artist, s.Album),
+	}
+
+	extra := ""
+	if s.Year > 0 {
+		extra += fmt.Sprintf("Year: %d  ", s.Year)
+	}
+	if s.Genre != "" {
+		extra += fmt.Sprintf("Genre: %s  ", s.Genre)
+	}
+	if s.TrackNum > 0 {
+		if s.TrackTotal > 0 {
+			extra += fmt.Sprintf("Track: %d/%d", s.TrackNum, s.TrackTotal)
+		} else {
+			extra += fmt.Sprintf("Track: %d", s.TrackNum)
+		}
+	}
+	if extra != "" {
+		lines = append(lines, extra)
+	}
+
+	for i, line := range lines {
+		if len(line) > w-1 {
+			line = line[:w-4] + "..."
+		}
+		drawText(x, y+i, line, termbox.ColorWhite, termbox.ColorDefault)
+	}
+}
+
+func drawText(x, y int, text string, fg, bg termbox.Attribute) {
+	for i, ch := range text {
+		termbox.SetCell(x+i, y, ch, fg, bg)
+	}
+}
+
+func playback(state *TUIState, currentCmd **exec.Cmd, songs *[]Song, songIndex *int) {
+	collection := connectToMongo()
+	criteria := parseQuery(state.query)
+	foundSongs, err := searchSongs(collection, criteria)
+	if err != nil {
+		return
+	}
+	*songs = foundSongs
+	*songIndex = 0
+
+	for *songIndex < len(*songs) {
+		song := (*songs)[*songIndex]
+		state.currentSong = &song
+		state.songIndex = *songIndex
+
+		var cmd *exec.Cmd
+		switch runtime.GOOS {
+		case "darwin":
+			cmd = exec.Command("afplay", song.ID)
+		case "linux":
+			if _, err := exec.LookPath("mpg123"); err == nil {
+				cmd = exec.Command("mpg123", "-q", song.ID)
+			} else if _, err := exec.LookPath("ffplay"); err == nil {
+				cmd = exec.Command("ffplay", "-nodisp", "-autoexit", song.ID)
+			}
+		case "windows":
+			cmd = exec.Command("cmd", "/C", "start", "/wait", song.ID)
+		}
+		if cmd == nil {
+			state.message = "No media player found"
+			return
+		}
+
+		*currentCmd = cmd
+		_ = cmd.Start()
+		_ = cmd.Wait()
+		*currentCmd = nil
+
+		*songIndex++
+	}
+
+	state.currentSong = nil
+	state.message = "Playback finished"
+}
+
+func skipSong(currentCmd **exec.Cmd, songs *[]Song, songIndex *int, state *TUIState) {
+	if *currentCmd != nil {
+		(*currentCmd).Process.Kill()
+		state.message = "Skipped"
+	}
+}
+
+func handleExternalCommand(cmd string, currentCmd **exec.Cmd, songs *[]Song, songIndex *int, state *TUIState) {
+	switch cmd {
+	case "skip":
+		skipSong(currentCmd, songs, songIndex, state)
+	case "stop":
+		if *currentCmd != nil {
+			(*currentCmd).Process.Kill()
+		}
+		state.message = "Stopped by external command"
 	}
 }
 
@@ -277,7 +760,6 @@ func listMusic(startYear, endYear int) {
 		return
 	}
 
-	// Print summary statistics
 	artistCounts := make(map[string]int)
 	genreCounts := make(map[string]int)
 	yearCounts := make(map[int]int)
@@ -309,22 +791,7 @@ func listMusic(startYear, endYear int) {
 	fmt.Printf("Total Genres: %d\n\n", len(genreCounts))
 
 	fmt.Println("--- Top 20 Artists ---")
-	type kv struct {
-		Key   string
-		Value int
-	}
-	var artistList []kv
-	for k, v := range artistCounts {
-		artistList = append(artistList, kv{k, v})
-	}
-	// Sort by count descending
-	for i := 0; i < len(artistList); i++ {
-		for j := i + 1; j < len(artistList); j++ {
-			if artistList[j].Value > artistList[i].Value {
-				artistList[i], artistList[j] = artistList[j], artistList[i]
-			}
-		}
-	}
+	artistList := mapToSortedSlice(artistCounts, true)
 	limit := 20
 	if len(artistList) < limit {
 		limit = len(artistList)
@@ -334,18 +801,7 @@ func listMusic(startYear, endYear int) {
 	}
 
 	fmt.Println("\n--- Top 20 Genres ---")
-	var genreList []kv
-	for k, v := range genreCounts {
-		genreList = append(genreList, kv{k, v})
-	}
-	// Sort by count descending
-	for i := 0; i < len(genreList); i++ {
-		for j := i + 1; j < len(genreList); j++ {
-			if genreList[j].Value > genreList[i].Value {
-				genreList[i], genreList[j] = genreList[j], genreList[i]
-			}
-		}
-	}
+	genreList := mapToSortedSlice(genreCounts, true)
 	limit = 20
 	if len(genreList) < limit {
 		limit = len(genreList)
@@ -355,144 +811,10 @@ func listMusic(startYear, endYear int) {
 	}
 
 	fmt.Println("\n--- Songs by Year ---")
-	var yearList []kv
-	for k, v := range yearCounts {
-		yearList = append(yearList, kv{strconv.Itoa(k), v})
-	}
-	// Sort by year ascending
-	for i := 0; i < len(yearList); i++ {
-		for j := i + 1; j < len(yearList); j++ {
-			yi, _ := strconv.Atoi(yearList[i].Key)
-			yj, _ := strconv.Atoi(yearList[j].Key)
-			if yj < yi {
-				yearList[i], yearList[j] = yearList[j], yearList[i]
-			}
-		}
-	}
+	yearList := yearMapToSortedSlice(yearCounts)
 	for _, item := range yearList {
 		fmt.Printf("  %s: %d\n", item.Key, item.Value)
 	}
-}
-
-/* ---------- query / playback ---------- */
-func queryMusic(cliQuery string, randomize bool, limit int) {
-	collection := connectToMongo()
-
-	if err := ioutil.WriteFile(pidFile, []byte(fmt.Sprintf("%d", os.Getpid())), 0644); err != nil {
-		log.Printf("Warning: Could not write PID file: %v", err)
-	}
-	defer os.Remove(pidFile)
-	defer os.Remove(commandFile)
-
-	nonInteractive := cliQuery != ""
-
-	if cliQuery == "" {
-		fmt.Println("\n=== DeeJay Music Query ===")
-		fmt.Println("Enter queries like:")
-		fmt.Println("  - play punk from the 1980s")
-		fmt.Println("  - play rock from 1995 to 2000")
-		fmt.Println("  - play jazz by Miles Davis")
-		fmt.Println("  - play songs from the 70s")
-		fmt.Println("Type 'quit' to exit\n")
-	}
-
-	scanner := bufio.NewScanner(os.Stdin)
-	for {
-		var query string
-		if cliQuery != "" {
-			query = cliQuery
-		} else {
-			fmt.Print("> ")
-			if !scanner.Scan() {
-				break
-			}
-			query = strings.TrimSpace(scanner.Text())
-		}
-		if query == "" {
-			continue
-		}
-		if strings.ToLower(query) == "quit" || strings.ToLower(query) == "exit" {
-			break
-		}
-
-		criteria := parseQuery(query)
-		songs, err := searchSongs(collection, criteria)
-		if err != nil {
-			fmt.Printf("Error searching: %v\n", err)
-			continue
-		}
-		if len(songs) == 0 {
-			fmt.Println("No songs found matching your criteria.")
-			if nonInteractive {
-				break
-			}
-			continue
-		}
-		if randomize {
-			rand.Shuffle(len(songs), func(i, j int) { songs[i], songs[j] = songs[j], songs[i] })
-		}
-		if limit > 0 && len(songs) > limit {
-			log.Printf("Limiting playlist from %d to %d songs", len(songs), limit)
-			songs = songs[:limit]
-		}
-
-		// Summarize playlist and decide whether to ask for confirmation
-		summarizePlaylist(songs)
-
-		// Skip confirmation if -r is used or if it's a direct CLI query
-		shouldPlay := randomize || nonInteractive
-
-		if !shouldPlay {
-			fmt.Printf("\nPlay all? (y/n): ")
-			if !scanner.Scan() {
-				break
-			}
-			if strings.ToLower(strings.TrimSpace(scanner.Text())) == "y" {
-				shouldPlay = true
-			} else {
-				continue
-			}
-		}
-		playSongs(songs, nonInteractive)
-		if nonInteractive {
-			break
-		}
-	}
-}
-
-func summarizePlaylist(songs []Song) {
-	if len(songs) == 0 {
-		return
-	}
-
-	artistCounts := make(map[string]int)
-	genreCounts := make(map[string]int)
-	yearCounts := make(map[int]int)
-
-	for _, s := range songs {
-		artistCounts[s.Artist]++
-		if s.Genre != "" {
-			genreCounts[s.Genre]++
-		}
-		if s.Year > 0 {
-			yearCounts[s.Year]++
-		}
-	}
-
-	fmt.Printf("\nFound %d songs.\n", len(songs))
-	fmt.Println("--- Artists ---")
-	for artist, count := range artistCounts {
-		fmt.Printf("  %s: %d\n", artist, count)
-	}
-	fmt.Println("--- Genres ---")
-	for genre, count := range genreCounts {
-		fmt.Printf("  %s: %d\n", genre, count)
-	}
-	fmt.Println("--- Years ---")
-	for year, count := range yearCounts {
-		fmt.Printf("  %d: %d\n", year, count)
-	}
-	fmt.Println("---------------")
 }
 
 /* ---------- mongo ---------- */
@@ -512,7 +834,6 @@ func connectToMongo() *mongo.Collection {
 	if err != nil {
 		log.Fatalf("Failed to connect to MongoDB: %v", err)
 	}
-	log.Println("Successfully connected to MongoDB.")
 	return client.Database(dbName).Collection(collectionName)
 }
 
@@ -584,139 +905,6 @@ func sendCommand(cmd string) {
 	p, _ := os.FindProcess(pid)
 	_ = p.Signal(syscall.SIGUSR1)
 	fmt.Printf("Sent '%s' command to DeeJay\n", cmd)
-}
-
-/* ---------- playback ---------- */
-func playSongs(songs []Song, nonInteractive bool) {
-	fmt.Println("\nControls: Press 's' to skip, 'q' to stop playback")
-	fmt.Println("Or use './dj skip' or './dj stop' from another terminal")
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGUSR1)
-
-	inputChan := make(chan string, 1)
-	go func() {
-		if err := keyboard.Open(); err != nil {
-			log.Printf("Failed to open keyboard: %v", err)
-			return
-		}
-		defer keyboard.Close()
-
-		for {
-			char, key, err := keyboard.GetKey()
-			if err != nil {
-				return
-			}
-			if key == keyboard.KeyEsc || key == keyboard.KeyCtrlC {
-				inputChan <- "q"
-				return
-			}
-			switch char {
-			case 's':
-				inputChan <- "s"
-			case 'q':
-				inputChan <- "q"
-				return
-			}
-		}
-	}()
-
-	commandChan := make(chan string, 1)
-	go func() {
-		for range sigChan {
-			if b, err := ioutil.ReadFile(commandFile); err == nil {
-				commandChan <- string(b)
-				_ = os.Remove(commandFile)
-			}
-		}
-	}()
-
-	for i, song := range songs {
-		fmt.Printf("\n[%d/%d] Now Playing:\n", i+1, len(songs))
-		fmt.Printf("  Title:       %s\n", song.Title)
-		fmt.Printf("  Artist:      %s\n", song.Artist)
-		fmt.Printf("  Album:       %s\n", song.Album)
-		if song.AlbumArtist != "" {
-			fmt.Printf("  Album Artist: %s\n", song.AlbumArtist)
-		}
-		if song.Year > 0 {
-			fmt.Printf("  Year:        %d\n", song.Year)
-		}
-		if song.Genre != "" {
-			fmt.Printf("  Genre:       %s\n", song.Genre)
-		}
-		if song.TrackNum > 0 {
-			if song.TrackTotal > 0 {
-				fmt.Printf("  Track:       %d/%d\n", song.TrackNum, song.TrackTotal)
-			} else {
-				fmt.Printf("  Track:       %d\n", song.TrackNum)
-			}
-		}
-		if song.DiscNum > 0 && song.DiscTotal > 0 {
-			fmt.Printf("  Disc:        %d/%d\n", song.DiscNum, song.DiscTotal)
-		}
-		if song.Composer != "" {
-			fmt.Printf("  Composer:    %s\n", song.Composer)
-		}
-		fmt.Printf("  Format:      %s\n", song.Format)
-		fmt.Printf("  File:        %s\n", song.ID)
-
-		var cmd *exec.Cmd
-		switch runtime.GOOS {
-		case "darwin":
-			cmd = exec.Command("afplay", song.ID)
-		case "linux":
-			if _, err := exec.LookPath("mpg123"); err == nil {
-				cmd = exec.Command("mpg123", "-q", song.ID)
-			} else if _, err := exec.LookPath("ffplay"); err == nil {
-				cmd = exec.Command("ffplay", "-nodisp", "-autoexit", song.ID)
-			}
-		case "windows":
-			cmd = exec.Command("cmd", "/C", "start", "/wait", song.ID)
-		}
-		if cmd == nil {
-			fmt.Println("No suitable media player found. Install mpg123 or ffplay.")
-			return
-		}
-		_ = cmd.Start()
-
-		done := make(chan error, 1)
-		go func() { done <- cmd.Wait() }()
-
-		stopped := false
-		select {
-		case in := <-inputChan:
-			switch in {
-			case "s", "skip":
-				fmt.Println("⏭️  Skipping to next song...")
-				_ = cmd.Process.Kill()
-			case "q", "quit", "stop":
-				fmt.Println("⏹️  Stopping playback...")
-				_ = cmd.Process.Kill()
-				stopped = true
-			}
-		case cmdIn := <-commandChan:
-			switch cmdIn {
-			case "skip":
-				fmt.Println("⏭️  Skipping to next song (external command)...")
-				_ = cmd.Process.Kill()
-			case "stop":
-				fmt.Println("⏹️  Stopping playback (external command)...")
-				_ = cmd.Process.Kill()
-				stopped = true
-			}
-		case <-done:
-		}
-		if stopped {
-			break
-		}
-	}
-	signal.Stop(sigChan)
-	if !nonInteractive {
-		// Close stdin to unblock the scanner goroutine
-		os.Stdin.Close()
-	}
-	fmt.Println("\n✓ Playback finished")
 }
 
 /* ---------- workers / helpers ---------- */
