@@ -84,7 +84,8 @@ type TUIState struct {
 	totalSongs   int
 	message      string
 	showHelp     bool
-	confirmQuit  bool // for confirm-on-quit
+	confirmQuit  bool   // for confirm-on-quit
+	playlist     []Song // Store current playlist
 }
 
 type CountItem struct {
@@ -226,7 +227,6 @@ func queryMusicTUI(cliQuery string, randomize bool, limit int) {
 	}
 	defer termbox.Close()
 
-	// Set input mode to ensure we get all events
 	termbox.SetInputMode(termbox.InputEsc | termbox.InputMouse)
 
 	state := &TUIState{
@@ -235,26 +235,24 @@ func queryMusicTUI(cliQuery string, randomize bool, limit int) {
 		artists:      []CountItem{},
 		genres:       []CountItem{},
 		years:        []CountItem{},
+		playlist:     []Song{}, // Initialize empty playlist
 	}
 
-	// playback manager context and channel
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	controlChan := make(chan controlMsg, 8)
 	go playbackManager(ctx, controlChan)
 
-	// If we have an initial query, run it and send play command
 	if cliQuery != "" {
 		if songs, err := runQueryAndReturn(collection, state, randomize, limit); err == nil && len(songs) > 0 {
 			controlChan <- controlMsg{Cmd: "play", Songs: songs}
 		}
 	}
 
-	// Create a separate context for the event polling goroutine
 	eventCtx, eventCancel := context.WithCancel(context.Background())
 	defer eventCancel()
 
-	eventChan := make(chan termbox.Event, 100) // Increased buffer
+	eventChan := make(chan termbox.Event, 100)
 	go func() {
 		for {
 			select {
@@ -267,7 +265,6 @@ func queryMusicTUI(cliQuery string, randomize bool, limit int) {
 				case <-eventCtx.Done():
 					return
 				default:
-					// Drop event if channel is full (prevents blocking)
 					log.Printf("Event channel full, dropping event")
 				}
 			}
@@ -295,7 +292,6 @@ func queryMusicTUI(cliQuery string, randomize bool, limit int) {
 	ticker := time.NewTicker(150 * time.Millisecond)
 	defer ticker.Stop()
 
-	// Initial draw
 	drawUI(state)
 
 	for {
@@ -304,13 +300,13 @@ func queryMusicTUI(cliQuery string, randomize bool, limit int) {
 			if ev.Type == termbox.EventKey {
 				quit := handleKeyEvent(&ev, state, collection, randomize, limit, controlChan)
 				if quit {
-					eventCancel() // Stop the event polling goroutine
+					eventCancel()
 					controlChan <- controlMsg{Cmd: "quit"}
 					cancel()
-					time.Sleep(100 * time.Millisecond) // Give time to clean up
+					time.Sleep(100 * time.Millisecond)
 					return
 				}
-				drawUI(state) // Redraw immediately after key event
+				drawUI(state)
 			} else if ev.Type == termbox.EventResize {
 				drawUI(state)
 			} else if ev.Type == termbox.EventError {
@@ -334,16 +330,14 @@ func queryMusicTUI(cliQuery string, randomize bool, limit int) {
 				if st.Msg != "" {
 					state.message = st.Msg
 				}
-				drawUI(state) // Redraw with updated status
+				drawUI(state)
 			case <-time.After(50 * time.Millisecond):
-				// timeout, skip this update
 			}
 		}
 	}
 }
 
 func handleKeyEvent(ev *termbox.Event, state *TUIState, collection *mongo.Collection, randomize bool, limit int, controlChan chan<- controlMsg) bool {
-	// reset confirm quit when any other key is pressed
 	resetConfirm := func() {
 		if state.confirmQuit {
 			state.confirmQuit = false
@@ -486,11 +480,11 @@ func runQueryAndReturn(collection *mongo.Collection, state *TUIState, randomize 
 	}
 	if len(songs) == 0 {
 		state.message = "No songs found"
-		// clear statistics
 		state.artists = nil
 		state.genres = nil
 		state.years = nil
 		state.totalSongs = 0
+		state.playlist = nil // Clear playlist
 		return nil, nil
 	}
 
@@ -523,6 +517,7 @@ func runQueryAndReturn(collection *mongo.Collection, state *TUIState, randomize 
 	state.years = yearMapToSortedSlice(yearCounts)
 	state.totalSongs = len(songs)
 	state.message = fmt.Sprintf("Found %d songs", len(songs))
+	state.playlist = songs // Store playlist
 
 	return songs, nil
 }
@@ -578,8 +573,8 @@ func drawUI(state *TUIState) {
 	}
 
 	// Calculate middle section height (leave space for bottom section + status)
-	bottomHeight := 10                                           // Approx lines for song info
-	statusPanelHeight := 3                                       // dedicated status panel height
+	bottomHeight := 10                                           // Lines for Playing Next (title + 9 songs)
+	statusPanelHeight := 4                                       // Lines for Now Playing details
 	middleHeight := h - 2 - bottomHeight - statusPanelHeight - 2 // -2 separators
 	if middleHeight < 5 {
 		middleHeight = 5
@@ -600,7 +595,7 @@ func drawUI(state *TUIState) {
 		termbox.SetCell(x, bottomY-1, '─', termbox.ColorWhite, termbox.ColorDefault)
 	}
 
-	// Bottom: Current song info (uses bottomHeight lines)
+	// Bottom: Playing Next (upcoming songs)
 	drawSongInfo(0, bottomY, w, state)
 
 	// Draw separator before status panel
@@ -608,7 +603,7 @@ func drawUI(state *TUIState) {
 		termbox.SetCell(x, statusY-1, '─', termbox.ColorWhite, termbox.ColorDefault)
 	}
 
-	// Status panel
+	// Status panel: Current song details
 	drawStatusPanel(0, statusY, w, state)
 
 	// Status line at very bottom
@@ -651,13 +646,11 @@ func drawHelp(w, h int) {
 }
 
 func drawColumn(x, y, w, h int, title string, items []CountItem, scroll int, active bool) {
-	// Highlight entire column background when active
 	bg := termbox.ColorDefault
 	if active {
 		bg = termbox.ColorDarkGray
 	}
 
-	// Clear the column area first
 	for dx := 0; dx < w; dx++ {
 		for dy := 0; dy < h; dy++ {
 			termbox.SetCell(x+dx, y+dy, ' ', termbox.ColorWhite, bg)
@@ -670,7 +663,6 @@ func drawColumn(x, y, w, h int, title string, items []CountItem, scroll int, act
 	}
 	drawText(x, y, title, fg, bg)
 
-	// Draw vertical separator
 	if x > 0 {
 		for dy := 0; dy < h; dy++ {
 			termbox.SetCell(x-1, y+dy, '│', termbox.ColorWhite, termbox.ColorDefault)
@@ -687,7 +679,6 @@ func drawColumn(x, y, w, h int, title string, items []CountItem, scroll int, act
 		drawText(x, y+1+i, line, termbox.ColorWhite, bg)
 	}
 
-	// Show scroll indicators
 	if scroll > 0 {
 		drawText(x+w-3, y, "▲", termbox.ColorCyan, bg)
 	}
@@ -697,18 +688,89 @@ func drawColumn(x, y, w, h int, title string, items []CountItem, scroll int, act
 }
 
 func drawSongInfo(x, y, w int, state *TUIState) {
+	// Clear the Playing Next area (10 lines)
+	for dy := 0; dy < 10; dy++ {
+		for dx := 0; dx < w; dx++ {
+			termbox.SetCell(x+dx, y+dy, ' ', termbox.ColorWhite, termbox.ColorDefault)
+		}
+	}
+
+	title := "Playing Next"
+	drawText(x, y, title, termbox.ColorYellow|termbox.AttrBold, termbox.ColorDefault)
+
+	if state.playlist == nil || len(state.playlist) == 0 {
+		drawText(x, y+1, "No playlist loaded", termbox.ColorWhite, termbox.ColorDefault)
+		return
+	}
+
+	// Show next 9 songs (title takes 1 line, total 10 lines)
+	startIdx := state.songIndex + 1
+	if startIdx >= len(state.playlist) {
+		drawText(x, y+1, "End of playlist", termbox.ColorWhite, termbox.ColorDefault)
+		return
+	}
+
+	endIdx := startIdx + 9
+	if endIdx > len(state.playlist) {
+		endIdx = len(state.playlist)
+	}
+
+	for i := startIdx; i < endIdx; i++ {
+		song := state.playlist[i]
+		// Format: "Artist - Title"
+		line := fmt.Sprintf(" %d. %s - %s", i+1, song.Artist, song.Title)
+		if len(line) > w-1 {
+			line = line[:w-4] + "..."
+		}
+		drawText(x, y+1+(i-startIdx), line, termbox.ColorWhite, termbox.ColorDefault)
+	}
+}
+
+func drawStatusPanel(x, y, w int, state *TUIState) {
+	// Clear the status panel area (4 lines)
+	for dy := 0; dy < 4; dy++ {
+		for dx := 0; dx < w; dx++ {
+			termbox.SetCell(x+dx, y+dy, ' ', termbox.ColorWhite, termbox.ColorDefault)
+		}
+	}
+
+	// Title
+	drawText(x+1, y, " Status ", termbox.ColorCyan|termbox.AttrBold, termbox.ColorDefault)
+
 	if state.currentSong == nil {
-		drawText(x, y, "No song playing", termbox.ColorWhite, termbox.ColorDefault)
+		drawText(x+1, y+1, "Idle", termbox.ColorWhite, termbox.ColorDefault)
+		// Show message if any
+		if state.message != "" {
+			msg := state.message
+			if len(msg) > w-4 {
+				msg = msg[:w-7] + "..."
+			}
+			drawText(x+1, y+2, msg, termbox.ColorBlack, termbox.ColorWhite)
+		}
 		return
 	}
 
 	s := state.currentSong
-	lines := []string{
-		fmt.Sprintf("[%d/%d] Now Playing:", state.songIndex+1, state.totalSongs),
-		fmt.Sprintf(" Title : %s", s.Title),
-		fmt.Sprintf(" Artist: %s  |  Album: %s", s.Artist, s.Album),
-	}
 
+	// Line 1: [index/total] Now Playing:
+	line1 := fmt.Sprintf("[%d/%d] Now Playing:", state.songIndex+1, state.totalSongs)
+	drawText(x+1, y+1, line1, termbox.ColorWhite, termbox.ColorDefault)
+
+	// Line 2: Title
+	line2 := fmt.Sprintf(" Title: %s", s.Title)
+	if len(line2) > w-4 {
+		line2 = line2[:w-7] + "..."
+	}
+	drawText(x+1, y+2, line2, termbox.ColorWhite, termbox.ColorDefault)
+
+	// Line 3: Artist - Album
+	line3 := fmt.Sprintf(" Artist: %s  |  Album: %s", s.Artist, s.Album)
+	if len(line3) > w-4 {
+		line3 = line3[:w-7] + "..."
+	}
+	drawText(x+1, y+3, line3, termbox.ColorWhite, termbox.ColorDefault)
+
+	// Optional 4th line with Year, Genre, Track (if space permits)
 	extra := ""
 	if s.Year > 0 {
 		extra += fmt.Sprintf("Year: %d  ", s.Year)
@@ -723,47 +785,12 @@ func drawSongInfo(x, y, w int, state *TUIState) {
 			extra += fmt.Sprintf("Track: %d", s.TrackNum)
 		}
 	}
-	if extra != "" {
-		lines = append(lines, " "+extra)
-	}
-
-	for i, line := range lines {
-		if len(line) > w-1 {
-			line = line[:w-4] + "..."
+	if extra != "" && w > 60 { // Only show if terminal is wide enough
+		line4 := " " + extra
+		if len(line4) > w-4 {
+			line4 = line4[:w-7] + "..."
 		}
-		drawText(x, y+i, line, termbox.ColorWhite, termbox.ColorDefault)
-	}
-}
-
-func drawStatusPanel(x, y, w int, state *TUIState) {
-	title := " Status "
-	// center title
-	titleX := x + 1
-	drawText(titleX, y, title, termbox.ColorCyan|termbox.AttrBold, termbox.ColorDefault)
-
-	msg := state.message
-	if msg == "" {
-		msg = "Idle"
-	}
-	// show current song summary on the next line
-	if state.currentSong != nil {
-		s := state.currentSong
-		summary := fmt.Sprintf("%d/%d %s - %s", state.songIndex+1, state.totalSongs, s.Artist, s.Title)
-		if len(summary) > w-4 {
-			summary = summary[:w-7] + "..."
-		}
-		drawText(x+1, y+1, summary, termbox.ColorWhite, termbox.ColorDefault)
-		// message below
-		if len(msg) > w-4 {
-			msg = msg[:w-7] + "..."
-		}
-		drawText(x+1, y+2, msg, termbox.ColorBlack, termbox.ColorWhite)
-	} else {
-		// no song playing; show message
-		if len(msg) > w-4 {
-			msg = msg[:w-7] + "..."
-		}
-		drawText(x+1, y+1, msg, termbox.ColorWhite, termbox.ColorDefault)
+		drawText(x+1, y+4, line4, termbox.ColorWhite, termbox.ColorDefault)
 	}
 }
 
@@ -775,26 +802,15 @@ func drawText(x, y int, text string, fg, bg termbox.Attribute) {
 
 /* ---------- Playback manager (rewritten, owns subprocesses) ---------- */
 
-/*
-playbackManager owns subprocesses and playlist state. It accepts controlMsg values:
- - Cmd: "play" with Songs set -> set/replace playlist and start playing from index 0
- - Cmd: "skip" -> kill current song and advance
- - Cmd: "stop" -> stop playback and clear playlist
- - Cmd: "status" -> reply on Reply channel with playerStatus
- - Cmd: "quit" -> stop and exit goroutine
-*/
-
 func playbackManager(ctx context.Context, control <-chan controlMsg) {
 	var playlist []Song
 	index := 0
 	var currentCmd *exec.Cmd
-	var mu sync.Mutex // protects currentCmd
+	var mu sync.Mutex
 
 	statusMsg := ""
 	for {
-		// If no playlist or index exhausted, wait for commands or quit
 		if playlist == nil || index >= len(playlist) {
-			// clear status
 			statusMsg = "Idle"
 			select {
 			case <-ctx.Done():
@@ -808,7 +824,6 @@ func playbackManager(ctx context.Context, control <-chan controlMsg) {
 				switch msg.Cmd {
 				case "play":
 					if len(msg.Songs) == 0 {
-						// nothing to do
 						continue
 					}
 					playlist = make([]Song, len(msg.Songs))
@@ -836,17 +851,14 @@ func playbackManager(ctx context.Context, control <-chan controlMsg) {
 					index = 0
 					statusMsg = "Stopped"
 				default:
-					// unknown
 				}
 			}
 			continue
 		}
 
-		// Play current index
 		song := playlist[index]
 		statusMsg = fmt.Sprintf("Playing %d/%d: %s - %s", index+1, len(playlist), song.Artist, song.Title)
 
-		// Build command for platform
 		var cmd *exec.Cmd
 		switch runtime.GOOS {
 		case "darwin":
@@ -860,7 +872,6 @@ func playbackManager(ctx context.Context, control <-chan controlMsg) {
 		case "windows":
 			cmd = exec.Command("cmd", "/C", "start", "/wait", song.ID)
 		default:
-			// unsupported
 			statusMsg = "No media player found for this OS"
 			playlist = nil
 			index = 0
@@ -921,7 +932,6 @@ func playbackManager(ctx context.Context, control <-chan controlMsg) {
 					statusMsg = "Stopped"
 					break waitLoop
 				case "play":
-					// swap playlist
 					mu.Lock()
 					if currentCmd != nil && currentCmd.Process != nil {
 						_ = currentCmd.Process.Kill()
@@ -934,10 +944,8 @@ func playbackManager(ctx context.Context, control <-chan controlMsg) {
 					statusMsg = fmt.Sprintf("Queued %d songs", len(playlist))
 					break waitLoop
 				case "status":
-					// reply with current info
 					if msg.Reply != nil {
 						var curSong *Song
-						// return pointer to a copy to avoid races
 						cur := song
 						curSong = &cur
 						msg.Reply <- playerStatus{
@@ -956,7 +964,6 @@ func playbackManager(ctx context.Context, control <-chan controlMsg) {
 					<-done
 					return
 				default:
-					// ignore
 				}
 			case err := <-done:
 				if err != nil {
@@ -967,7 +974,6 @@ func playbackManager(ctx context.Context, control <-chan controlMsg) {
 			}
 		}
 
-		// cleanup currentCmd after song ended or was killed
 		mu.Lock()
 		currentCmd = nil
 		mu.Unlock()
