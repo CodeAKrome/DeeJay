@@ -211,110 +211,6 @@ type controlMsg struct {
 	Reply chan playerStatus
 }
 
-// func queryMusicTUI(cliQuery string, randomize bool, limit int) {
-// 	collection := connectToMongo()
-
-// 	if err := ioutil.WriteFile(pidFile, []byte(fmt.Sprintf("%d", os.Getpid())), 0644); err != nil {
-// 		log.Printf("Warning: Could not write PID file: %v", err)
-// 	}
-// 	defer os.Remove(pidFile)
-// 	defer os.Remove(commandFile)
-
-// 	err := termbox.Init()
-// 	if err != nil {
-// 		panic(err)
-// 	}
-// 	defer termbox.Close()
-
-// 	state := &TUIState{
-// 		query:        cliQuery,
-// 		activeWindow: "query",
-// 		artists:      []CountItem{},
-// 		genres:       []CountItem{},
-// 		years:        []CountItem{},
-// 	}
-
-// 	// playback manager context and channel
-// 	ctx, cancel := context.WithCancel(context.Background())
-// 	defer cancel()
-// 	controlChan := make(chan controlMsg, 8)
-// 	go playbackManager(ctx, controlChan) // playbackManager owns its internal state
-
-// 	// If we have an initial query, run it and send play command
-// 	if cliQuery != "" {
-// 		if songs, err := runQueryAndReturn(collection, state, randomize, limit); err == nil && len(songs) > 0 {
-// 			controlChan <- controlMsg{Cmd: "play", Songs: songs}
-// 		}
-// 	}
-
-// 	eventChan := make(chan termbox.Event)
-// 	go func() {
-// 		for {
-// 			eventChan <- termbox.PollEvent()
-// 		}
-// 	}()
-
-// 	sigChan := make(chan os.Signal, 1)
-// 	signal.Notify(sigChan, syscall.SIGUSR1)
-
-// 	commandFileChan := make(chan string, 1)
-// 	go func() {
-// 		for range sigChan {
-// 			if b, err := ioutil.ReadFile(commandFile); err == nil {
-// 				commandFileChan <- string(b)
-// 				_ = os.Remove(commandFile)
-// 			}
-// 		}
-// 	}()
-
-// 	ticker := time.NewTicker(150 * time.Millisecond)
-// 	defer ticker.Stop()
-
-// 	for {
-// 		select {
-// 		case ev := <-eventChan:
-// 			if ev.Type == termbox.EventKey {
-// 				quit := handleKeyEvent(&ev, state, collection, randomize, limit, controlChan)
-// 				if quit {
-// 					// ask playback manager to quit and cancel context
-// 					controlChan <- controlMsg{Cmd: "quit"}
-// 					// give manager a short moment
-// 					cancel()
-// 					return
-// 				}
-// 			} else if ev.Type == termbox.EventResize {
-// 				// Just redraw on resize
-// 			}
-// 		case cmd := <-commandFileChan:
-// 			// forward external command to playback manager
-// 			switch strings.TrimSpace(cmd) {
-// 			case "skip":
-// 				controlChan <- controlMsg{Cmd: "skip"}
-// 			case "stop":
-// 				controlChan <- controlMsg{Cmd: "stop"}
-// 			default:
-// 				// ignore unknown
-// 			}
-// 		case <-ticker.C:
-// 			// ask playback manager for status and update TUI state
-// 			reply := make(chan playerStatus, 1)
-// 			controlChan <- controlMsg{Cmd: "status", Reply: reply}
-// 			select {
-// 			case st := <-reply:
-// 				state.currentSong = st.Song
-// 				state.songIndex = st.Index
-// 				state.totalSongs = st.Total
-// 				if st.Msg != "" {
-// 					state.message = st.Msg
-// 				}
-// 			default:
-// 				// no response in this tick
-// 			}
-// 		}
-// 		drawUI(state)
-// 	}
-// }
-
 func queryMusicTUI(cliQuery string, randomize bool, limit int) {
 	collection := connectToMongo()
 
@@ -358,7 +254,7 @@ func queryMusicTUI(cliQuery string, randomize bool, limit int) {
 	eventCtx, eventCancel := context.WithCancel(context.Background())
 	defer eventCancel()
 
-	eventChan := make(chan termbox.Event, 10) // Buffered channel
+	eventChan := make(chan termbox.Event, 100) // Increased buffer
 	go func() {
 		for {
 			select {
@@ -370,6 +266,9 @@ func queryMusicTUI(cliQuery string, randomize bool, limit int) {
 				case eventChan <- ev:
 				case <-eventCtx.Done():
 					return
+				default:
+					// Drop event if channel is full (prevents blocking)
+					log.Printf("Event channel full, dropping event")
 				}
 			}
 		}
@@ -507,23 +406,27 @@ func handleKeyEvent(ev *termbox.Event, state *TUIState, collection *mongo.Collec
 					return true
 				}
 				resetConfirm()
+				return false
 			case 's':
 				resetConfirm()
-				if state.activeWindow != "query" {
-					controlChan <- controlMsg{Cmd: "skip"}
-				}
+				controlChan <- controlMsg{Cmd: "skip"}
+				return false
 			case 'a':
 				resetConfirm()
 				state.activeWindow = "artist"
+				return false
 			case 'g':
 				resetConfirm()
 				state.activeWindow = "genre"
+				return false
 			case 'y':
 				resetConfirm()
 				state.activeWindow = "year"
+				return false
 			case 'h', '?':
 				resetConfirm()
 				state.showHelp = true
+				return false
 			default:
 				resetConfirm()
 				if state.activeWindow == "query" {
@@ -539,6 +442,9 @@ func handleKeyEvent(ev *termbox.Event, state *TUIState, collection *mongo.Collec
 func scrollWindow(state *TUIState, delta int) {
 	switch state.activeWindow {
 	case "artist":
+		if len(state.artists) == 0 {
+			return
+		}
 		state.artistScroll += delta
 		if state.artistScroll < 0 {
 			state.artistScroll = 0
@@ -547,6 +453,9 @@ func scrollWindow(state *TUIState, delta int) {
 			state.artistScroll = len(state.artists) - 1
 		}
 	case "genre":
+		if len(state.genres) == 0 {
+			return
+		}
 		state.genreScroll += delta
 		if state.genreScroll < 0 {
 			state.genreScroll = 0
@@ -555,6 +464,9 @@ func scrollWindow(state *TUIState, delta int) {
 			state.genreScroll = len(state.genres) - 1
 		}
 	case "year":
+		if len(state.years) == 0 {
+			return
+		}
 		state.yearScroll += delta
 		if state.yearScroll < 0 {
 			state.yearScroll = 0
@@ -739,11 +651,24 @@ func drawHelp(w, h int) {
 }
 
 func drawColumn(x, y, w, h int, title string, items []CountItem, scroll int, active bool) {
+	// Highlight entire column background when active
+	bg := termbox.ColorDefault
+	if active {
+		bg = termbox.ColorDarkGray
+	}
+
+	// Clear the column area first
+	for dx := 0; dx < w; dx++ {
+		for dy := 0; dy < h; dy++ {
+			termbox.SetCell(x+dx, y+dy, ' ', termbox.ColorWhite, bg)
+		}
+	}
+
 	fg := termbox.ColorWhite
 	if active {
 		fg = termbox.ColorYellow | termbox.AttrBold
 	}
-	drawText(x, y, title, fg, termbox.ColorDefault)
+	drawText(x, y, title, fg, bg)
 
 	// Draw vertical separator
 	if x > 0 {
@@ -759,15 +684,15 @@ func drawColumn(x, y, w, h int, title string, items []CountItem, scroll int, act
 		if len(line) > w-1 {
 			line = line[:w-4] + "..."
 		}
-		drawText(x, y+1+i, line, termbox.ColorWhite, termbox.ColorDefault)
+		drawText(x, y+1+i, line, termbox.ColorWhite, bg)
 	}
 
 	// Show scroll indicators
 	if scroll > 0 {
-		drawText(x+w-3, y, "▲", termbox.ColorCyan, termbox.ColorDefault)
+		drawText(x+w-3, y, "▲", termbox.ColorCyan, bg)
 	}
 	if scroll+visibleHeight < len(items) {
-		drawText(x+w-3, y+h-1, "▼", termbox.ColorCyan, termbox.ColorDefault)
+		drawText(x+w-3, y+h-1, "▼", termbox.ColorCyan, bg)
 	}
 }
 
