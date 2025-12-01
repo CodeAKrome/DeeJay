@@ -235,7 +235,7 @@ func queryMusicTUI(cliQuery string, randomize bool, limit int) {
 		artists:      []CountItem{},
 		genres:       []CountItem{},
 		years:        []CountItem{},
-		playlist:     []Song{}, // Initialize empty playlist
+		playlist:     []Song{},
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -351,8 +351,15 @@ func handleKeyEvent(ev *termbox.Event, state *TUIState, collection *mongo.Collec
 	}
 
 	switch ev.Key {
-	case termbox.KeyEsc, termbox.KeyCtrlC:
-		return true
+	case termbox.KeyCtrlC:
+		return true // Ctrl-C always quits immediately
+	case termbox.KeyEsc:
+		resetConfirm()
+		if state.activeWindow == "query" {
+			// Exit query window and switch to artist window
+			state.activeWindow = "artist"
+		}
+		return false
 	case termbox.KeySpace:
 		resetConfirm()
 		state.activeWindow = "query"
@@ -391,16 +398,13 @@ func handleKeyEvent(ev *termbox.Event, state *TUIState, collection *mongo.Collec
 		if ev.Ch != 0 {
 			switch ev.Ch {
 			case 'q':
-				if state.activeWindow != "query" {
-					if !state.confirmQuit {
-						state.confirmQuit = true
-						state.message = "Press q again to quit"
-						return false
-					}
-					return true
+				// q quits from any window with double-press confirmation
+				if !state.confirmQuit {
+					state.confirmQuit = true
+					state.message = "Press q again to quit"
+					return false
 				}
-				resetConfirm()
-				return false
+				return true
 			case 's':
 				resetConfirm()
 				controlChan <- controlMsg{Cmd: "skip"}
@@ -484,7 +488,7 @@ func runQueryAndReturn(collection *mongo.Collection, state *TUIState, randomize 
 		state.genres = nil
 		state.years = nil
 		state.totalSongs = 0
-		state.playlist = nil // Clear playlist
+		state.playlist = nil
 		return nil, nil
 	}
 
@@ -495,7 +499,6 @@ func runQueryAndReturn(collection *mongo.Collection, state *TUIState, randomize 
 		songs = songs[:limit]
 	}
 
-	// Update statistics
 	artistCounts := make(map[string]int)
 	genreCounts := make(map[string]int)
 	yearCounts := make(map[int]int)
@@ -517,7 +520,7 @@ func runQueryAndReturn(collection *mongo.Collection, state *TUIState, randomize 
 	state.years = yearMapToSortedSlice(yearCounts)
 	state.totalSongs = len(songs)
 	state.message = fmt.Sprintf("Found %d songs", len(songs))
-	state.playlist = songs // Store playlist
+	state.playlist = songs
 
 	return songs, nil
 }
@@ -572,10 +575,10 @@ func drawUI(state *TUIState) {
 		termbox.SetCell(x, 1, '─', termbox.ColorWhite, termbox.ColorDefault)
 	}
 
-	// Calculate middle section height (leave space for bottom section + status)
-	bottomHeight := 10                                           // Lines for Playing Next (title + 9 songs)
-	statusPanelHeight := 4                                       // Lines for Now Playing details
-	middleHeight := h - 2 - bottomHeight - statusPanelHeight - 2 // -2 separators
+	// Calculate middle section height
+	bottomHeight := 10
+	statusPanelHeight := 4
+	middleHeight := h - 2 - bottomHeight - statusPanelHeight - 2
 	if middleHeight < 5 {
 		middleHeight = 5
 	}
@@ -595,7 +598,7 @@ func drawUI(state *TUIState) {
 		termbox.SetCell(x, bottomY-1, '─', termbox.ColorWhite, termbox.ColorDefault)
 	}
 
-	// Bottom: Playing Next (upcoming songs)
+	// Bottom: Playing Next
 	drawSongInfo(0, bottomY, w, state)
 
 	// Draw separator before status panel
@@ -603,7 +606,7 @@ func drawUI(state *TUIState) {
 		termbox.SetCell(x, statusY-1, '─', termbox.ColorWhite, termbox.ColorDefault)
 	}
 
-	// Status panel: Current song details
+	// Status panel: Now Playing
 	drawStatusPanel(0, statusY, w, state)
 
 	// Status line at very bottom
@@ -623,14 +626,15 @@ func drawHelp(w, h int) {
 		"",
 		"  Space   - Jump to query window",
 		"  Enter   - Execute query and play",
-		"  q       - Quit (press twice to confirm when not in query)",
+		"  q       - Quit (press twice to confirm)",
 		"  s       - Skip current song",
 		"  a       - Switch to Artists window",
 		"  g       - Switch to Genres window",
 		"  y       - Switch to Years window",
 		"  ↑/↓     - Scroll in active window",
 		"  h or ?  - Show this help",
-		"  Esc     - Close help / Quit",
+		"  Esc     - Close help / Unfocus query",
+		"  Ctrl-C  - Quit immediately",
 		"",
 		"Press any key to close help...",
 	}
@@ -688,7 +692,6 @@ func drawColumn(x, y, w, h int, title string, items []CountItem, scroll int, act
 }
 
 func drawSongInfo(x, y, w int, state *TUIState) {
-	// Clear the Playing Next area (10 lines)
 	for dy := 0; dy < 10; dy++ {
 		for dx := 0; dx < w; dx++ {
 			termbox.SetCell(x+dx, y+dy, ' ', termbox.ColorWhite, termbox.ColorDefault)
@@ -703,7 +706,6 @@ func drawSongInfo(x, y, w int, state *TUIState) {
 		return
 	}
 
-	// Show next 9 songs (title takes 1 line, total 10 lines)
 	startIdx := state.songIndex + 1
 	if startIdx >= len(state.playlist) {
 		drawText(x, y+1, "End of playlist", termbox.ColorWhite, termbox.ColorDefault)
@@ -717,7 +719,6 @@ func drawSongInfo(x, y, w int, state *TUIState) {
 
 	for i := startIdx; i < endIdx; i++ {
 		song := state.playlist[i]
-		// Format: "Artist - Title"
 		line := fmt.Sprintf(" %d. %s - %s", i+1, song.Artist, song.Title)
 		if len(line) > w-1 {
 			line = line[:w-4] + "..."
@@ -727,19 +728,16 @@ func drawSongInfo(x, y, w int, state *TUIState) {
 }
 
 func drawStatusPanel(x, y, w int, state *TUIState) {
-	// Clear the status panel area (4 lines)
 	for dy := 0; dy < 4; dy++ {
 		for dx := 0; dx < w; dx++ {
 			termbox.SetCell(x+dx, y+dy, ' ', termbox.ColorWhite, termbox.ColorDefault)
 		}
 	}
 
-	// Title
 	drawText(x+1, y, " Status ", termbox.ColorCyan|termbox.AttrBold, termbox.ColorDefault)
 
 	if state.currentSong == nil {
 		drawText(x+1, y+1, "Idle", termbox.ColorWhite, termbox.ColorDefault)
-		// Show message if any
 		if state.message != "" {
 			msg := state.message
 			if len(msg) > w-4 {
@@ -751,26 +749,21 @@ func drawStatusPanel(x, y, w int, state *TUIState) {
 	}
 
 	s := state.currentSong
-
-	// Line 1: [index/total] Now Playing:
 	line1 := fmt.Sprintf("[%d/%d] Now Playing:", state.songIndex+1, state.totalSongs)
 	drawText(x+1, y+1, line1, termbox.ColorWhite, termbox.ColorDefault)
 
-	// Line 2: Title
 	line2 := fmt.Sprintf(" Title: %s", s.Title)
 	if len(line2) > w-4 {
 		line2 = line2[:w-7] + "..."
 	}
 	drawText(x+1, y+2, line2, termbox.ColorWhite, termbox.ColorDefault)
 
-	// Line 3: Artist - Album
 	line3 := fmt.Sprintf(" Artist: %s  |  Album: %s", s.Artist, s.Album)
 	if len(line3) > w-4 {
 		line3 = line3[:w-7] + "..."
 	}
 	drawText(x+1, y+3, line3, termbox.ColorWhite, termbox.ColorDefault)
 
-	// Optional 4th line with Year, Genre, Track (if space permits)
 	extra := ""
 	if s.Year > 0 {
 		extra += fmt.Sprintf("Year: %d  ", s.Year)
@@ -785,7 +778,7 @@ func drawStatusPanel(x, y, w int, state *TUIState) {
 			extra += fmt.Sprintf("Track: %d", s.TrackNum)
 		}
 	}
-	if extra != "" && w > 60 { // Only show if terminal is wide enough
+	if extra != "" && w > 60 {
 		line4 := " " + extra
 		if len(line4) > w-4 {
 			line4 = line4[:w-7] + "..."
@@ -800,7 +793,7 @@ func drawText(x, y int, text string, fg, bg termbox.Attribute) {
 	}
 }
 
-/* ---------- Playback manager (rewritten, owns subprocesses) ---------- */
+/* ---------- Playback manager ---------- */
 
 func playbackManager(ctx context.Context, control <-chan controlMsg) {
 	var playlist []Song
