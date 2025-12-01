@@ -84,6 +84,7 @@ type TUIState struct {
 	totalSongs   int
 	message      string
 	showHelp     bool
+	confirmQuit  bool // for confirm-on-quit
 }
 
 type CountItem struct {
@@ -195,7 +196,125 @@ func main() {
 	}
 }
 
-/* ---------- TUI ---------- */
+/* ---------- TUI + control protocol ---------- */
+
+type playerStatus struct {
+	Song  *Song
+	Index int
+	Total int
+	Msg   string
+}
+
+type controlMsg struct {
+	Cmd   string
+	Songs []Song
+	Reply chan playerStatus
+}
+
+// func queryMusicTUI(cliQuery string, randomize bool, limit int) {
+// 	collection := connectToMongo()
+
+// 	if err := ioutil.WriteFile(pidFile, []byte(fmt.Sprintf("%d", os.Getpid())), 0644); err != nil {
+// 		log.Printf("Warning: Could not write PID file: %v", err)
+// 	}
+// 	defer os.Remove(pidFile)
+// 	defer os.Remove(commandFile)
+
+// 	err := termbox.Init()
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	defer termbox.Close()
+
+// 	state := &TUIState{
+// 		query:        cliQuery,
+// 		activeWindow: "query",
+// 		artists:      []CountItem{},
+// 		genres:       []CountItem{},
+// 		years:        []CountItem{},
+// 	}
+
+// 	// playback manager context and channel
+// 	ctx, cancel := context.WithCancel(context.Background())
+// 	defer cancel()
+// 	controlChan := make(chan controlMsg, 8)
+// 	go playbackManager(ctx, controlChan) // playbackManager owns its internal state
+
+// 	// If we have an initial query, run it and send play command
+// 	if cliQuery != "" {
+// 		if songs, err := runQueryAndReturn(collection, state, randomize, limit); err == nil && len(songs) > 0 {
+// 			controlChan <- controlMsg{Cmd: "play", Songs: songs}
+// 		}
+// 	}
+
+// 	eventChan := make(chan termbox.Event)
+// 	go func() {
+// 		for {
+// 			eventChan <- termbox.PollEvent()
+// 		}
+// 	}()
+
+// 	sigChan := make(chan os.Signal, 1)
+// 	signal.Notify(sigChan, syscall.SIGUSR1)
+
+// 	commandFileChan := make(chan string, 1)
+// 	go func() {
+// 		for range sigChan {
+// 			if b, err := ioutil.ReadFile(commandFile); err == nil {
+// 				commandFileChan <- string(b)
+// 				_ = os.Remove(commandFile)
+// 			}
+// 		}
+// 	}()
+
+// 	ticker := time.NewTicker(150 * time.Millisecond)
+// 	defer ticker.Stop()
+
+// 	for {
+// 		select {
+// 		case ev := <-eventChan:
+// 			if ev.Type == termbox.EventKey {
+// 				quit := handleKeyEvent(&ev, state, collection, randomize, limit, controlChan)
+// 				if quit {
+// 					// ask playback manager to quit and cancel context
+// 					controlChan <- controlMsg{Cmd: "quit"}
+// 					// give manager a short moment
+// 					cancel()
+// 					return
+// 				}
+// 			} else if ev.Type == termbox.EventResize {
+// 				// Just redraw on resize
+// 			}
+// 		case cmd := <-commandFileChan:
+// 			// forward external command to playback manager
+// 			switch strings.TrimSpace(cmd) {
+// 			case "skip":
+// 				controlChan <- controlMsg{Cmd: "skip"}
+// 			case "stop":
+// 				controlChan <- controlMsg{Cmd: "stop"}
+// 			default:
+// 				// ignore unknown
+// 			}
+// 		case <-ticker.C:
+// 			// ask playback manager for status and update TUI state
+// 			reply := make(chan playerStatus, 1)
+// 			controlChan <- controlMsg{Cmd: "status", Reply: reply}
+// 			select {
+// 			case st := <-reply:
+// 				state.currentSong = st.Song
+// 				state.songIndex = st.Index
+// 				state.totalSongs = st.Total
+// 				if st.Msg != "" {
+// 					state.message = st.Msg
+// 				}
+// 			default:
+// 				// no response in this tick
+// 			}
+// 		}
+// 		drawUI(state)
+// 	}
+// }
+
 func queryMusicTUI(cliQuery string, randomize bool, limit int) {
 	collection := connectToMongo()
 
@@ -211,6 +330,9 @@ func queryMusicTUI(cliQuery string, randomize bool, limit int) {
 	}
 	defer termbox.Close()
 
+	// Set input mode to ensure we get all events
+	termbox.SetInputMode(termbox.InputEsc | termbox.InputMouse)
+
 	state := &TUIState{
 		query:        cliQuery,
 		activeWindow: "query",
@@ -219,58 +341,117 @@ func queryMusicTUI(cliQuery string, randomize bool, limit int) {
 		years:        []CountItem{},
 	}
 
-	// If we have an initial query, run it
+	// playback manager context and channel
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	controlChan := make(chan controlMsg, 8)
+	go playbackManager(ctx, controlChan)
+
+	// If we have an initial query, run it and send play command
 	if cliQuery != "" {
-		runQuery(collection, state, randomize, limit)
+		if songs, err := runQueryAndReturn(collection, state, randomize, limit); err == nil && len(songs) > 0 {
+			controlChan <- controlMsg{Cmd: "play", Songs: songs}
+		}
 	}
 
-	eventChan := make(chan termbox.Event)
+	// Create a separate context for the event polling goroutine
+	eventCtx, eventCancel := context.WithCancel(context.Background())
+	defer eventCancel()
+
+	eventChan := make(chan termbox.Event, 10) // Buffered channel
 	go func() {
 		for {
-			eventChan <- termbox.PollEvent()
+			select {
+			case <-eventCtx.Done():
+				return
+			default:
+				ev := termbox.PollEvent()
+				select {
+				case eventChan <- ev:
+				case <-eventCtx.Done():
+					return
+				}
+			}
 		}
 	}()
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGUSR1)
 
-	commandChan := make(chan string, 1)
+	commandFileChan := make(chan string, 1)
 	go func() {
-		for range sigChan {
-			if b, err := ioutil.ReadFile(commandFile); err == nil {
-				commandChan <- string(b)
-				_ = os.Remove(commandFile)
+		for {
+			select {
+			case <-sigChan:
+				if b, err := ioutil.ReadFile(commandFile); err == nil {
+					commandFileChan <- string(b)
+					_ = os.Remove(commandFile)
+				}
+			case <-eventCtx.Done():
+				return
 			}
 		}
 	}()
 
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(150 * time.Millisecond)
 	defer ticker.Stop()
 
-	var currentCmd *exec.Cmd
-	var songs []Song
-	var songIndex int
+	// Initial draw
+	drawUI(state)
 
 	for {
 		select {
 		case ev := <-eventChan:
 			if ev.Type == termbox.EventKey {
-				if handleKeyEvent(&ev, state, collection, randomize, limit, &currentCmd, &songs, &songIndex) {
+				quit := handleKeyEvent(&ev, state, collection, randomize, limit, controlChan)
+				if quit {
+					eventCancel() // Stop the event polling goroutine
+					controlChan <- controlMsg{Cmd: "quit"}
+					cancel()
+					time.Sleep(100 * time.Millisecond) // Give time to clean up
 					return
 				}
+				drawUI(state) // Redraw immediately after key event
 			} else if ev.Type == termbox.EventResize {
-				// Just redraw on resize
+				drawUI(state)
+			} else if ev.Type == termbox.EventError {
+				log.Printf("Termbox error: %v", ev.Err)
 			}
-		case cmd := <-commandChan:
-			handleExternalCommand(cmd, &currentCmd, &songs, &songIndex, state)
+		case cmd := <-commandFileChan:
+			switch strings.TrimSpace(cmd) {
+			case "skip":
+				controlChan <- controlMsg{Cmd: "skip"}
+			case "stop":
+				controlChan <- controlMsg{Cmd: "stop"}
+			}
 		case <-ticker.C:
-			// Periodic redraw
+			reply := make(chan playerStatus, 1)
+			controlChan <- controlMsg{Cmd: "status", Reply: reply}
+			select {
+			case st := <-reply:
+				state.currentSong = st.Song
+				state.songIndex = st.Index
+				state.totalSongs = st.Total
+				if st.Msg != "" {
+					state.message = st.Msg
+				}
+				drawUI(state) // Redraw with updated status
+			case <-time.After(50 * time.Millisecond):
+				// timeout, skip this update
+			}
 		}
-		drawUI(state)
 	}
 }
 
-func handleKeyEvent(ev *termbox.Event, state *TUIState, collection *mongo.Collection, randomize bool, limit int, currentCmd **exec.Cmd, songs *[]Song, songIndex *int) bool {
+func handleKeyEvent(ev *termbox.Event, state *TUIState, collection *mongo.Collection, randomize bool, limit int, controlChan chan<- controlMsg) bool {
+	// reset confirm quit when any other key is pressed
+	resetConfirm := func() {
+		if state.confirmQuit {
+			state.confirmQuit = false
+			state.message = ""
+		}
+	}
+
 	if state.showHelp {
 		state.showHelp = false
 		return false
@@ -280,51 +461,71 @@ func handleKeyEvent(ev *termbox.Event, state *TUIState, collection *mongo.Collec
 	case termbox.KeyEsc, termbox.KeyCtrlC:
 		return true
 	case termbox.KeySpace:
+		resetConfirm()
 		state.activeWindow = "query"
 		state.cursorPos = len(state.query)
 	case termbox.KeyEnter:
+		resetConfirm()
 		if state.activeWindow == "query" {
-			runQuery(collection, state, randomize, limit)
-			// Start playback
-			go playback(state, currentCmd, songs, songIndex)
+			if songs, err := runQueryAndReturn(collection, state, randomize, limit); err == nil && len(songs) > 0 {
+				controlChan <- controlMsg{Cmd: "play", Songs: songs}
+				state.message = fmt.Sprintf("Playing %d songs", len(songs))
+			}
 		}
 	case termbox.KeyBackspace, termbox.KeyBackspace2:
+		resetConfirm()
 		if state.activeWindow == "query" && state.cursorPos > 0 {
 			state.query = state.query[:state.cursorPos-1] + state.query[state.cursorPos:]
 			state.cursorPos--
 		}
 	case termbox.KeyArrowLeft:
+		resetConfirm()
 		if state.activeWindow == "query" && state.cursorPos > 0 {
 			state.cursorPos--
 		}
 	case termbox.KeyArrowRight:
+		resetConfirm()
 		if state.activeWindow == "query" && state.cursorPos < len(state.query) {
 			state.cursorPos++
 		}
 	case termbox.KeyArrowUp:
+		resetConfirm()
 		scrollWindow(state, -1)
 	case termbox.KeyArrowDown:
+		resetConfirm()
 		scrollWindow(state, 1)
 	default:
 		if ev.Ch != 0 {
 			switch ev.Ch {
 			case 'q':
 				if state.activeWindow != "query" {
+					if !state.confirmQuit {
+						state.confirmQuit = true
+						state.message = "Press q again to quit"
+						return false
+					}
 					return true
 				}
+				resetConfirm()
 			case 's':
+				resetConfirm()
 				if state.activeWindow != "query" {
-					skipSong(currentCmd, songs, songIndex, state)
+					controlChan <- controlMsg{Cmd: "skip"}
 				}
 			case 'a':
+				resetConfirm()
 				state.activeWindow = "artist"
 			case 'g':
+				resetConfirm()
 				state.activeWindow = "genre"
 			case 'y':
+				resetConfirm()
 				state.activeWindow = "year"
 			case 'h', '?':
+				resetConfirm()
 				state.showHelp = true
 			default:
+				resetConfirm()
 				if state.activeWindow == "query" {
 					state.query = state.query[:state.cursorPos] + string(ev.Ch) + state.query[state.cursorPos:]
 					state.cursorPos++
@@ -364,16 +565,21 @@ func scrollWindow(state *TUIState, delta int) {
 	}
 }
 
-func runQuery(collection *mongo.Collection, state *TUIState, randomize bool, limit int) {
+func runQueryAndReturn(collection *mongo.Collection, state *TUIState, randomize bool, limit int) ([]Song, error) {
 	criteria := parseQuery(state.query)
 	songs, err := searchSongs(collection, criteria)
 	if err != nil {
 		state.message = fmt.Sprintf("Error: %v", err)
-		return
+		return nil, err
 	}
 	if len(songs) == 0 {
 		state.message = "No songs found"
-		return
+		// clear statistics
+		state.artists = nil
+		state.genres = nil
+		state.years = nil
+		state.totalSongs = 0
+		return nil, nil
 	}
 
 	if randomize {
@@ -405,6 +611,8 @@ func runQuery(collection *mongo.Collection, state *TUIState, randomize bool, lim
 	state.years = yearMapToSortedSlice(yearCounts)
 	state.totalSongs = len(songs)
 	state.message = fmt.Sprintf("Found %d songs", len(songs))
+
+	return songs, nil
 }
 
 func mapToSortedSlice(m map[string]int, descending bool) []CountItem {
@@ -457,15 +665,17 @@ func drawUI(state *TUIState) {
 		termbox.SetCell(x, 1, '─', termbox.ColorWhite, termbox.ColorDefault)
 	}
 
-	// Calculate middle section height (leave space for bottom section)
-	bottomHeight := 12                       // Approximate lines needed for song info
-	middleHeight := h - 2 - bottomHeight - 1 // -2 for top, -1 for separator
+	// Calculate middle section height (leave space for bottom section + status)
+	bottomHeight := 10                                           // Approx lines for song info
+	statusPanelHeight := 3                                       // dedicated status panel height
+	middleHeight := h - 2 - bottomHeight - statusPanelHeight - 2 // -2 separators
 	if middleHeight < 5 {
 		middleHeight = 5
 	}
 
 	middleY := 2
 	bottomY := middleY + middleHeight + 1
+	statusY := bottomY + bottomHeight
 
 	// Middle: Three columns
 	colWidth := w / 3
@@ -478,13 +688,24 @@ func drawUI(state *TUIState) {
 		termbox.SetCell(x, bottomY-1, '─', termbox.ColorWhite, termbox.ColorDefault)
 	}
 
-	// Bottom: Current song info
+	// Bottom: Current song info (uses bottomHeight lines)
 	drawSongInfo(0, bottomY, w, state)
 
+	// Draw separator before status panel
+	for x := 0; x < w; x++ {
+		termbox.SetCell(x, statusY-1, '─', termbox.ColorWhite, termbox.ColorDefault)
+	}
+
+	// Status panel
+	drawStatusPanel(0, statusY, w, state)
+
 	// Status line at very bottom
-	statusY := h - 1
-	status := fmt.Sprintf(" [Space]=Query [a/g/y]=Windows [↑↓]=Scroll [s]=Skip [q]=Quit [?]=Help | %s", state.message)
-	drawText(0, statusY, status, termbox.ColorBlack, termbox.ColorWhite)
+	footerY := h - 1
+	footer := fmt.Sprintf(" [Space]=Query [a/g/y]=Windows [↑↓]=Scroll [s]=Skip [q]=Quit [?]=Help | %s", state.message)
+	if len(footer) > w {
+		footer = footer[:w]
+	}
+	drawText(0, footerY, footer, termbox.ColorBlack, termbox.ColorWhite)
 
 	termbox.Flush()
 }
@@ -495,7 +716,7 @@ func drawHelp(w, h int) {
 		"",
 		"  Space   - Jump to query window",
 		"  Enter   - Execute query and play",
-		"  q       - Quit (when not in query window)",
+		"  q       - Quit (press twice to confirm when not in query)",
 		"  s       - Skip current song",
 		"  a       - Switch to Artists window",
 		"  g       - Switch to Genres window",
@@ -559,8 +780,8 @@ func drawSongInfo(x, y, w int, state *TUIState) {
 	s := state.currentSong
 	lines := []string{
 		fmt.Sprintf("[%d/%d] Now Playing:", state.songIndex+1, state.totalSongs),
-		fmt.Sprintf("Title: %s", s.Title),
-		fmt.Sprintf("Artist: %s  |  Album: %s", s.Artist, s.Album),
+		fmt.Sprintf(" Title : %s", s.Title),
+		fmt.Sprintf(" Artist: %s  |  Album: %s", s.Artist, s.Album),
 	}
 
 	extra := ""
@@ -578,7 +799,7 @@ func drawSongInfo(x, y, w int, state *TUIState) {
 		}
 	}
 	if extra != "" {
-		lines = append(lines, extra)
+		lines = append(lines, " "+extra)
 	}
 
 	for i, line := range lines {
@@ -589,27 +810,118 @@ func drawSongInfo(x, y, w int, state *TUIState) {
 	}
 }
 
+func drawStatusPanel(x, y, w int, state *TUIState) {
+	title := " Status "
+	// center title
+	titleX := x + 1
+	drawText(titleX, y, title, termbox.ColorCyan|termbox.AttrBold, termbox.ColorDefault)
+
+	msg := state.message
+	if msg == "" {
+		msg = "Idle"
+	}
+	// show current song summary on the next line
+	if state.currentSong != nil {
+		s := state.currentSong
+		summary := fmt.Sprintf("%d/%d %s - %s", state.songIndex+1, state.totalSongs, s.Artist, s.Title)
+		if len(summary) > w-4 {
+			summary = summary[:w-7] + "..."
+		}
+		drawText(x+1, y+1, summary, termbox.ColorWhite, termbox.ColorDefault)
+		// message below
+		if len(msg) > w-4 {
+			msg = msg[:w-7] + "..."
+		}
+		drawText(x+1, y+2, msg, termbox.ColorBlack, termbox.ColorWhite)
+	} else {
+		// no song playing; show message
+		if len(msg) > w-4 {
+			msg = msg[:w-7] + "..."
+		}
+		drawText(x+1, y+1, msg, termbox.ColorWhite, termbox.ColorDefault)
+	}
+}
+
 func drawText(x, y int, text string, fg, bg termbox.Attribute) {
 	for i, ch := range text {
 		termbox.SetCell(x+i, y, ch, fg, bg)
 	}
 }
 
-func playback(state *TUIState, currentCmd **exec.Cmd, songs *[]Song, songIndex *int) {
-	collection := connectToMongo()
-	criteria := parseQuery(state.query)
-	foundSongs, err := searchSongs(collection, criteria)
-	if err != nil {
-		return
-	}
-	*songs = foundSongs
-	*songIndex = 0
+/* ---------- Playback manager (rewritten, owns subprocesses) ---------- */
 
-	for *songIndex < len(*songs) {
-		song := (*songs)[*songIndex]
-		state.currentSong = &song
-		state.songIndex = *songIndex
+/*
+playbackManager owns subprocesses and playlist state. It accepts controlMsg values:
+ - Cmd: "play" with Songs set -> set/replace playlist and start playing from index 0
+ - Cmd: "skip" -> kill current song and advance
+ - Cmd: "stop" -> stop playback and clear playlist
+ - Cmd: "status" -> reply on Reply channel with playerStatus
+ - Cmd: "quit" -> stop and exit goroutine
+*/
 
+func playbackManager(ctx context.Context, control <-chan controlMsg) {
+	var playlist []Song
+	index := 0
+	var currentCmd *exec.Cmd
+	var mu sync.Mutex // protects currentCmd
+
+	statusMsg := ""
+	for {
+		// If no playlist or index exhausted, wait for commands or quit
+		if playlist == nil || index >= len(playlist) {
+			// clear status
+			statusMsg = "Idle"
+			select {
+			case <-ctx.Done():
+				mu.Lock()
+				if currentCmd != nil && currentCmd.Process != nil {
+					_ = currentCmd.Process.Kill()
+				}
+				mu.Unlock()
+				return
+			case msg := <-control:
+				switch msg.Cmd {
+				case "play":
+					if len(msg.Songs) == 0 {
+						// nothing to do
+						continue
+					}
+					playlist = make([]Song, len(msg.Songs))
+					copy(playlist, msg.Songs)
+					index = 0
+					statusMsg = fmt.Sprintf("Queued %d songs", len(playlist))
+				case "status":
+					if msg.Reply != nil {
+						msg.Reply <- playerStatus{
+							Song:  nil,
+							Index: 0,
+							Total: 0,
+							Msg:   statusMsg,
+						}
+					}
+				case "quit":
+					mu.Lock()
+					if currentCmd != nil && currentCmd.Process != nil {
+						_ = currentCmd.Process.Kill()
+					}
+					mu.Unlock()
+					return
+				case "stop":
+					playlist = nil
+					index = 0
+					statusMsg = "Stopped"
+				default:
+					// unknown
+				}
+			}
+			continue
+		}
+
+		// Play current index
+		song := playlist[index]
+		statusMsg = fmt.Sprintf("Playing %d/%d: %s - %s", index+1, len(playlist), song.Artist, song.Title)
+
+		// Build command for platform
 		var cmd *exec.Cmd
 		switch runtime.GOOS {
 		case "darwin":
@@ -622,44 +934,123 @@ func playback(state *TUIState, currentCmd **exec.Cmd, songs *[]Song, songIndex *
 			}
 		case "windows":
 			cmd = exec.Command("cmd", "/C", "start", "/wait", song.ID)
+		default:
+			// unsupported
+			statusMsg = "No media player found for this OS"
+			playlist = nil
+			index = 0
+			continue
 		}
+
 		if cmd == nil {
-			state.message = "No media player found"
-			return
+			statusMsg = "No media player found"
+			playlist = nil
+			index = 0
+			continue
 		}
 
-		*currentCmd = cmd
-		_ = cmd.Start()
-		_ = cmd.Wait()
-		*currentCmd = nil
-
-		*songIndex++
-	}
-
-	state.currentSong = nil
-	state.message = "Playback finished"
-}
-
-func skipSong(currentCmd **exec.Cmd, songs *[]Song, songIndex *int, state *TUIState) {
-	if *currentCmd != nil {
-		(*currentCmd).Process.Kill()
-		state.message = "Skipped"
-	}
-}
-
-func handleExternalCommand(cmd string, currentCmd **exec.Cmd, songs *[]Song, songIndex *int, state *TUIState) {
-	switch cmd {
-	case "skip":
-		skipSong(currentCmd, songs, songIndex, state)
-	case "stop":
-		if *currentCmd != nil {
-			(*currentCmd).Process.Kill()
+		if err := cmd.Start(); err != nil {
+			statusMsg = fmt.Sprintf("Failed to start player: %v", err)
+			index++
+			continue
 		}
-		state.message = "Stopped by external command"
+
+		mu.Lock()
+		currentCmd = cmd
+		mu.Unlock()
+
+		done := make(chan error, 1)
+		go func(c *exec.Cmd) { done <- c.Wait() }(cmd)
+
+	waitLoop:
+		for {
+			select {
+			case <-ctx.Done():
+				mu.Lock()
+				if currentCmd != nil && currentCmd.Process != nil {
+					_ = currentCmd.Process.Kill()
+				}
+				mu.Unlock()
+				<-done
+				return
+			case msg := <-control:
+				switch msg.Cmd {
+				case "skip":
+					mu.Lock()
+					if currentCmd != nil && currentCmd.Process != nil {
+						_ = currentCmd.Process.Kill()
+					}
+					mu.Unlock()
+					<-done
+					index++
+					break waitLoop
+				case "stop":
+					mu.Lock()
+					if currentCmd != nil && currentCmd.Process != nil {
+						_ = currentCmd.Process.Kill()
+					}
+					mu.Unlock()
+					<-done
+					playlist = nil
+					index = 0
+					statusMsg = "Stopped"
+					break waitLoop
+				case "play":
+					// swap playlist
+					mu.Lock()
+					if currentCmd != nil && currentCmd.Process != nil {
+						_ = currentCmd.Process.Kill()
+					}
+					mu.Unlock()
+					<-done
+					playlist = make([]Song, len(msg.Songs))
+					copy(playlist, msg.Songs)
+					index = 0
+					statusMsg = fmt.Sprintf("Queued %d songs", len(playlist))
+					break waitLoop
+				case "status":
+					// reply with current info
+					if msg.Reply != nil {
+						var curSong *Song
+						// return pointer to a copy to avoid races
+						cur := song
+						curSong = &cur
+						msg.Reply <- playerStatus{
+							Song:  curSong,
+							Index: index,
+							Total: len(playlist),
+							Msg:   statusMsg,
+						}
+					}
+				case "quit":
+					mu.Lock()
+					if currentCmd != nil && currentCmd.Process != nil {
+						_ = currentCmd.Process.Kill()
+					}
+					mu.Unlock()
+					<-done
+					return
+				default:
+					// ignore
+				}
+			case err := <-done:
+				if err != nil {
+					statusMsg = fmt.Sprintf("Player exited: %v", err)
+				}
+				index++
+				break waitLoop
+			}
+		}
+
+		// cleanup currentCmd after song ended or was killed
+		mu.Lock()
+		currentCmd = nil
+		mu.Unlock()
 	}
 }
 
 /* ---------- indexing ---------- */
+
 func indexMusic(musicDir string) {
 	collection := connectToMongo()
 
@@ -732,6 +1123,7 @@ func indexMusic(musicDir string) {
 }
 
 /* ---------- list ---------- */
+
 func listMusic(startYear, endYear int) {
 	collection := connectToMongo()
 
@@ -818,6 +1210,7 @@ func listMusic(startYear, endYear int) {
 }
 
 /* ---------- mongo ---------- */
+
 func connectToMongo() *mongo.Collection {
 	user := os.Getenv("MONGO_USER")
 	if user == "" {
@@ -838,6 +1231,7 @@ func connectToMongo() *mongo.Collection {
 }
 
 /* ---------- query parsing ---------- */
+
 func parseQuery(q string) QueryCriteria {
 	q = strings.ToLower(q)
 	c := QueryCriteria{}
@@ -871,6 +1265,7 @@ func parseQuery(q string) QueryCriteria {
 }
 
 /* ---------- search ---------- */
+
 func searchSongs(coll *mongo.Collection, criteria QueryCriteria) ([]Song, error) {
 	filter := bson.M{}
 	if criteria.Genre != "" {
@@ -892,7 +1287,8 @@ func searchSongs(coll *mongo.Collection, criteria QueryCriteria) ([]Song, error)
 	return songs, nil
 }
 
-/* ---------- control commands ---------- */
+/* ---------- control commands (external) ---------- */
+
 func sendCommand(cmd string) {
 	if _, err := os.Stat(pidFile); os.IsNotExist(err) {
 		fmt.Println("DeeJay is not running in query mode.")
@@ -908,6 +1304,7 @@ func sendCommand(cmd string) {
 }
 
 /* ---------- workers / helpers ---------- */
+
 func worker(id int, jobs <-chan string, results chan<- *Song, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for path := range jobs {
@@ -957,6 +1354,7 @@ func calculateHashAndSize(r io.Reader) (string, int64, error) {
 }
 
 /* ---------- mongo indexes ---------- */
+
 func createIndexes(coll *mongo.Collection) error {
 	models := []mongo.IndexModel{
 		{Keys: bson.D{{Key: "artist", Value: 1}}},
@@ -970,6 +1368,7 @@ func createIndexes(coll *mongo.Collection) error {
 }
 
 /* ---------- duplicates report ---------- */
+
 func findAndReportDuplicates(coll *mongo.Collection) error {
 	pipe := mongo.Pipeline{
 		bson.D{{Key: "$group", Value: bson.D{
