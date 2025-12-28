@@ -1,2 +1,2 @@
 go build
-sudo mv player /usr/local/bin/dj
+sudo cp player /usr/local/bin/dj
